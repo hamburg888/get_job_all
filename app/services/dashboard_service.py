@@ -6,9 +6,41 @@ from sqlalchemy.orm import Session
 from app.models.entities import DeliveryRecord, DeliveryStatus, Job, Platform, TaskLog, TaskRun, TaskStatus
 
 
-def list_jobs(db: Session, platform: Platform) -> list[Job]:
+def list_jobs(db: Session, platform: Platform) -> list[dict]:
     stmt = select(Job).where(Job.platform == platform.value).order_by(desc(Job.discovered_at)).limit(50)
-    return list(db.scalars(stmt))
+    jobs = list(db.scalars(stmt))
+    job_ids = [job.id for job in jobs]
+    latest_delivery_map: dict[int, DeliveryRecord] = {}
+    if job_ids:
+        delivery_stmt = (
+            select(DeliveryRecord)
+            .where(DeliveryRecord.job_id.in_(job_ids))
+            .order_by(desc(DeliveryRecord.created_at))
+        )
+        for delivery in db.scalars(delivery_stmt):
+            latest_delivery_map.setdefault(delivery.job_id, delivery)
+
+    return [
+        {
+            "id": job.id,
+            "platform": platform,
+            "platform_job_id": job.platform_job_id,
+            "title": job.title,
+            "company_name": job.company_name,
+            "salary_text": job.salary_text,
+            "salary_min": job.salary_min,
+            "salary_max": job.salary_max,
+            "city": job.city,
+            "experience_text": job.experience_text,
+            "detail_url": job.detail_url,
+            "tags": job.tags,
+            "latest_status": job.latest_status,
+            "discovered_at": job.discovered_at,
+            "delivered_at": latest_delivery_map.get(job.id).created_at if latest_delivery_map.get(job.id) else None,
+            "latest_reason": latest_delivery_map.get(job.id).status_reason if latest_delivery_map.get(job.id) else None,
+        }
+        for job in jobs
+    ]
 
 
 def list_deliveries(db: Session, platform: Platform) -> list[DeliveryRecord]:
@@ -61,20 +93,26 @@ def get_stats(db: Session, platform: Platform) -> dict:
     jobs = list_jobs(db, platform)
     salary_counter: Counter[str] = Counter()
     experience_counter: Counter[str] = Counter()
+    city_counter: Counter[str] = Counter()
     for job in jobs:
-        if job.salary_min is None:
+        salary_min = job.get("salary_min")
+        experience_text = job.get("experience_text") or "未标注"
+        city_text = job.get("city") or "未标注"
+        if salary_min is None:
             salary_counter["未标注"] += 1
-        elif job.salary_min < 10:
+        elif salary_min < 10:
             salary_counter["10K以下"] += 1
-        elif job.salary_min < 20:
+        elif salary_min < 20:
             salary_counter["10-20K"] += 1
-        elif job.salary_min < 30:
+        elif salary_min < 30:
             salary_counter["20-30K"] += 1
         else:
             salary_counter["30K以上"] += 1
-        experience_counter[job.experience_text or "未标注"] += 1
+        experience_counter[experience_text] += 1
+        city_counter[city_text] += 1
 
     return {
         "salary_buckets": [{"label": label, "value": value} for label, value in salary_counter.items()],
         "experience_buckets": [{"label": label, "value": value} for label, value in experience_counter.items()],
+        "city_buckets": [{"label": label, "value": value} for label, value in city_counter.items()],
     }

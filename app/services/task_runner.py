@@ -37,31 +37,33 @@ class TaskRunner:
                 return self.status(payload.platform)
 
             with SessionLocal() as db:
+                auto_send_chat = payload.auto_send_chat if payload.platform == Platform.BOSS else False
+                chat_template = payload.chat_template if payload.platform == Platform.BOSS else ""
                 rule = db.scalar(select(RuleConfig).where(RuleConfig.platform == platform_key).limit(1))
                 if rule:
-                    rule.keyword = payload.keyword
-                    rule.city = payload.city
+                    rule.keyword = ",".join(payload.keywords or payload.search_terms)
+                    rule.city = ",".join(payload.cities)
                     rule.salary_min = payload.salary_min
                     rule.salary_max = payload.salary_max
                     rule.cooldown_days = payload.cooldown_days
-                    rule.auto_send_chat = payload.auto_send_chat
-                    rule.chat_template = payload.chat_template
+                    rule.auto_send_chat = auto_send_chat
+                    rule.chat_template = chat_template
                 else:
                     rule = RuleConfig(
                         platform=platform_key,
-                        keyword=payload.keyword,
-                        city=payload.city,
+                        keyword=",".join(payload.keywords or payload.search_terms),
+                        city=",".join(payload.cities),
                         salary_min=payload.salary_min,
                         salary_max=payload.salary_max,
                         cooldown_days=payload.cooldown_days,
-                        auto_send_chat=payload.auto_send_chat,
-                        chat_template=payload.chat_template,
+                        auto_send_chat=auto_send_chat,
+                        chat_template=chat_template,
                     )
                     db.add(rule)
 
                 task = TaskRun(
                     platform=platform_key,
-                    keyword=payload.keyword,
+                    keyword=",".join(payload.search_terms),
                     status=TaskStatus.RUNNING.value,
                     current_step="正在准备浏览器与筛选条件",
                     processed_count=0,
@@ -185,6 +187,16 @@ class TaskRunner:
                 task.current_step = f"处理中: {job_payload['title']}"
                 task.processed_count += 1
 
+                filter_result = self._match_filters(job_payload, payload)
+                delivery_status = (
+                    DeliveryStatus.DELIVERED.value
+                    if filter_result["matched"] and job_payload.get("delivery_success", True)
+                    else DeliveryStatus.SKIPPED.value if not filter_result["matched"] else DeliveryStatus.FAILED.value
+                )
+                status_reason = (
+                    filter_result["reason"] if not filter_result["matched"] else job_payload.get("status_reason", "职位已投递")
+                )
+
                 existing_job = db.scalar(
                     select(Job).where(
                         Job.platform == payload.platform.value,
@@ -197,16 +209,12 @@ class TaskRunner:
                     existing_job.salary_text = job_payload["salary_text"]
                     existing_job.salary_min = job_payload.get("salary_min")
                     existing_job.salary_max = job_payload.get("salary_max")
-                    existing_job.city = job_payload.get("city", payload.city)
+                    existing_job.city = job_payload.get("city", payload.cities[0] if payload.cities else "")
                     existing_job.experience_text = job_payload.get("experience_text", "不限")
                     existing_job.description = job_payload["description"]
                     existing_job.detail_url = job_payload["detail_url"]
                     existing_job.tags = job_payload.get("tags", [])
-                    existing_job.latest_status = (
-                        DeliveryStatus.DELIVERED.value
-                        if job_payload.get("delivery_success", True)
-                        else DeliveryStatus.FAILED.value
-                    )
+                    existing_job.latest_status = delivery_status
                     existing_job.task_run_id = task.id
                     job = existing_job
                 else:
@@ -218,16 +226,12 @@ class TaskRunner:
                         salary_text=job_payload["salary_text"],
                         salary_min=job_payload.get("salary_min"),
                         salary_max=job_payload.get("salary_max"),
-                        city=job_payload.get("city", payload.city),
+                        city=job_payload.get("city", payload.cities[0] if payload.cities else ""),
                         experience_text=job_payload.get("experience_text", "不限"),
                         description=job_payload["description"],
                         detail_url=job_payload["detail_url"],
                         tags=job_payload.get("tags", []),
-                        latest_status=(
-                            DeliveryStatus.DELIVERED.value
-                            if job_payload.get("delivery_success", True)
-                            else DeliveryStatus.FAILED.value
-                        ),
+                        latest_status=delivery_status,
                         task_run_id=task.id,
                     )
                     db.add(job)
@@ -237,17 +241,15 @@ class TaskRunner:
                     job_id=job.id,
                     task_run_id=task.id,
                     platform=payload.platform.value,
-                    status=(
-                        DeliveryStatus.DELIVERED.value
-                        if job_payload.get("delivery_success", True)
-                        else DeliveryStatus.FAILED.value
-                    ),
-                    status_reason=job_payload.get("status_reason", "职位已投递"),
+                    status=delivery_status,
+                    status_reason=status_reason,
                     chat_sent=False,
                     chat_message="",
                 )
                 db.add(delivery)
-                if job_payload.get("delivery_success", True):
+                if not filter_result["matched"]:
+                    task.failed_count += 1
+                elif job_payload.get("delivery_success", True):
                     task.delivered_count += 1
                 else:
                     task.failed_count += 1
@@ -256,8 +258,16 @@ class TaskRunner:
                         platform=payload.platform.value,
                         task_run_id=task.id,
                         event_type="job_processed",
-                        message=f"已处理岗位 {job.title} / {job.company_name} / {delivery.status}",
-                        extra_json={"detail_url": job.detail_url, "platform_job_id": job.platform_job_id},
+                        message=(
+                            f"搜索词 {job_payload.get('search_term', '')} | "
+                            f"{job.title} / {job.company_name} / {delivery.status} / {status_reason}"
+                        ),
+                        extra_json={
+                            "detail_url": job.detail_url,
+                            "platform_job_id": job.platform_job_id,
+                            "search_term": job_payload.get("search_term"),
+                            "reason": status_reason,
+                        },
                     )
                 )
                 db.commit()
@@ -272,7 +282,7 @@ class TaskRunner:
                     asyncio.set_event_loop(loop)
                     loop.run_until_complete(
                         adapter.run_search_flow(
-                            payload.keyword,
+                            payload.search_terms,
                             process_job,
                             stop_event.is_set,
                             update_step,
@@ -285,7 +295,7 @@ class TaskRunner:
             else:
                 asyncio.run(
                     adapter.run_search_flow(
-                        payload.keyword,
+                        payload.search_terms,
                         process_job,
                         stop_event.is_set,
                         update_step,
@@ -294,7 +304,7 @@ class TaskRunner:
                 )
         else:
             self._set_status(task_run_id, TaskStatus.RUNNING, "模拟执行智联搜索与投递流程")
-            adapter.run_sync_mock(payload.keyword, process_job, stop_event.is_set)
+            adapter.run_sync_mock(",".join(payload.search_terms), process_job, stop_event.is_set)
 
     def _run_mock_boss(self, task_run_id: int, payload: StartTaskRequest, stop_event: threading.Event) -> None:
         samples = [
@@ -319,7 +329,7 @@ class TaskRunner:
                     salary_text=salary,
                     salary_min=20 if index == 1 else 30,
                     salary_max=30 if index == 1 else 45,
-                    city=payload.city or "深圳",
+                    city=(payload.cities[0] if payload.cities else "深圳"),
                     experience_text=exp,
                     description="Boss 双页面任务演示数据",
                     detail_url=f"https://www.zhipin.com/job_detail/runtime-{task_run_id}-{index}.html",
@@ -344,6 +354,26 @@ class TaskRunner:
                 self._log(payload.platform, task.id, "chat_sync", f"Boss 新会话已处理: {company} / {title}")
                 db.commit()
             time.sleep(1.5)
+
+    def _match_filters(self, job_payload: dict, payload: StartTaskRequest) -> dict[str, str | bool]:
+        if payload.cities:
+            job_city = (job_payload.get("city") or "").strip()
+            if job_city and job_city not in payload.cities:
+                return {"matched": False, "reason": f"城市不匹配: {job_city}"}
+
+        if payload.keywords:
+            haystack = " ".join(
+                [
+                    job_payload.get("title", ""),
+                    job_payload.get("description", ""),
+                    job_payload.get("company_name", ""),
+                    " ".join(job_payload.get("tags", [])),
+                ]
+            ).lower()
+            if not any(keyword.lower() in haystack for keyword in payload.keywords):
+                return {"matched": False, "reason": "未命中关键词筛选"}
+
+        return {"matched": True, "reason": "命中过滤条件"}
 
     def _set_status(self, task_run_id: int, status: TaskStatus, current_step: str) -> None:
         with SessionLocal() as db:

@@ -7,8 +7,9 @@ from app.models.entities import DeliveryStatus, Platform, TaskStatus
 
 class StartTaskRequest(BaseModel):
     platform: Platform
-    keyword: str = Field(min_length=1, max_length=120)
-    city: str = ""
+    search_terms: list[str] = Field(min_length=1)
+    keywords: list[str] = Field(default_factory=list)
+    cities: list[str] = Field(default_factory=list)
     salary_min: int | None = None
     salary_max: int | None = None
     cooldown_days: int = 7
@@ -51,9 +52,8 @@ class JobOut(BaseModel):
     tags: list[str]
     latest_status: DeliveryStatus
     discovered_at: datetime
-
-    class Config:
-        from_attributes = True
+    delivered_at: datetime | None = None
+    latest_reason: str | None = None
 
 
 class DeliveryOut(BaseModel):
@@ -100,3 +100,4 @@ class StatsBucketOut(BaseModel):
 class StatsOut(BaseModel):
     salary_buckets: list[StatsBucketOut]
     experience_buckets: list[StatsBucketOut]
+    city_buckets: list[StatsBucketOut]

@@ -60,7 +60,7 @@ class ZhilianAdapter:
 
     async def run_search_flow(
         self,
-        keyword: str,
+        search_terms: list[str],
         per_job_callback: Callable[[dict], None],
         should_stop: Callable[[], bool],
         status_callback: Callable[[str], None] | None = None,
@@ -83,52 +83,60 @@ class ZhilianAdapter:
                 if should_stop():
                     await context.close()
                     return
-            await list_page.locator(self.selectors.keyword_input).fill(keyword)
-            await list_page.locator(self.selectors.search_button).click()
-            await list_page.wait_for_timeout(10_000)
-
-            while not should_stop():
-                cards = list_page.locator(self.selectors.job_card)
-                count = await cards.count()
-                if count == 0:
-                    logger.warning("No job cards found on current page.")
-                    if status_callback:
-                        status_callback("当前页未找到岗位卡片，任务结束。")
-                    break
-                # Temporary test mode: only process the first job on each page,
-                # then jump to the next page to verify pagination flow.
-                for index in range(min(count, 1)):
-                    if should_stop():
-                        break
-                    if status_callback:
-                        status_callback(f"正在打开第 {index + 1} 个岗位详情")
-                    async with context.expect_page() as page_info:
-                        await cards.nth(index).click()
-                    detail_page = await page_info.value
-                    await detail_page.wait_for_load_state("domcontentloaded")
-                    detail_url = detail_page.url
-                    job_payload = await self.extract_job_payload(detail_page, detail_url)
-                    try:
-                        await detail_page.locator(self.selectors.deliver_button).click(timeout=5000)
-                        await detail_page.wait_for_timeout(2000)
-                        delivery_result = await self.detect_delivery_success(context, detail_page)
-                        job_payload["delivery_success"] = delivery_result["success"]
-                        job_payload["status_reason"] = delivery_result["reason"]
-                    except PlaywrightTimeoutError:
-                        logger.info("Deliver button not clickable for %s", detail_url)
-                        job_payload["delivery_success"] = False
-                        job_payload["status_reason"] = "未找到可点击的立即投递按钮"
-                    finally:
-                        per_job_callback(job_payload)
-                        await self.close_extra_tabs(context, list_page)
-
-                next_page = list_page.locator(self.selectors.next_page)
-                if await next_page.count() == 0:
+            for search_term in search_terms:
+                if should_stop():
                     break
                 if status_callback:
-                    status_callback("当前页处理完成，准备进入下一页")
-                await next_page.click()
-                await list_page.wait_for_timeout(4000)
+                    status_callback(f"正在搜索关键词: {search_term}")
+                await list_page.goto(settings.zhilian_entry_url, wait_until="domcontentloaded")
+                await list_page.locator(self.selectors.keyword_input).fill("")
+                await list_page.locator(self.selectors.keyword_input).fill(search_term)
+                await list_page.locator(self.selectors.search_button).click()
+                await list_page.wait_for_timeout(10_000)
+
+                while not should_stop():
+                    cards = list_page.locator(self.selectors.job_card)
+                    count = await cards.count()
+                    if count == 0:
+                        logger.warning("No job cards found on current page.")
+                        if status_callback:
+                            status_callback(f"搜索词 {search_term} 当前页未找到岗位卡片，切换下一个搜索词。")
+                        break
+                    # Temporary test mode: only process the first job on each page,
+                    # then jump to the next page to verify pagination flow.
+                    for index in range(min(count, 1)):
+                        if should_stop():
+                            break
+                        if status_callback:
+                            status_callback(f"搜索词 {search_term}：正在打开第 {index + 1} 个岗位详情")
+                        async with context.expect_page() as page_info:
+                            await cards.nth(index).click()
+                        detail_page = await page_info.value
+                        await detail_page.wait_for_load_state("domcontentloaded")
+                        detail_url = detail_page.url
+                        job_payload = await self.extract_job_payload(detail_page, detail_url)
+                        job_payload["search_term"] = search_term
+                        try:
+                            await detail_page.locator(self.selectors.deliver_button).click(timeout=5000)
+                            await detail_page.wait_for_timeout(2000)
+                            delivery_result = await self.detect_delivery_success(context, detail_page)
+                            job_payload["delivery_success"] = delivery_result["success"]
+                            job_payload["status_reason"] = delivery_result["reason"]
+                        except PlaywrightTimeoutError:
+                            logger.info("Deliver button not clickable for %s", detail_url)
+                            job_payload["delivery_success"] = False
+                            job_payload["status_reason"] = "未找到可点击的立即投递按钮"
+                        finally:
+                            per_job_callback(job_payload)
+                            await self.close_extra_tabs(context, list_page)
+
+                    next_page = list_page.locator(self.selectors.next_page)
+                    if await next_page.count() == 0:
+                        break
+                    if status_callback:
+                        status_callback(f"搜索词 {search_term} 当前页处理完成，准备进入下一页")
+                    await next_page.click()
+                    await list_page.wait_for_timeout(4000)
 
             await context.close()
 
