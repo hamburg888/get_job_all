@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -16,6 +17,7 @@ from app.schemas.common import (
     OverviewOut,
     PaginatedDeliveriesOut,
     PaginatedJobsOut,
+    PreviewStateOut,
     StartTaskRequest,
     StatsOut,
     StopTaskRequest,
@@ -24,6 +26,7 @@ from app.schemas.common import (
 from app.services.account_browser_service import account_browser_service
 from app.services.account_service import create_account, get_account, list_accounts, set_default_account, update_account
 from app.services.dashboard_service import get_overview, get_stats, list_deliveries, list_jobs, list_logs
+from app.services.live_preview_service import live_preview_service
 from app.services.task_runner import task_runner
 
 router = APIRouter()
@@ -101,6 +104,16 @@ def dashboard_stats(platform: Platform, db: Session = Depends(get_db)) -> dict:
 @router.get("/tasks/status/{platform}", response_model=TaskStatusResponse)
 def get_task_status(platform: Platform) -> TaskStatusResponse:
     return task_runner.status(platform)
+
+
+@router.get("/tasks/preview/state/{platform}", response_model=PreviewStateOut)
+def get_preview_state(platform: Platform) -> dict:
+    return live_preview_service.snapshot(platform)
+
+
+@router.get("/tasks/preview/stream/{platform}")
+async def stream_preview(platform: Platform) -> StreamingResponse:
+    return StreamingResponse(live_preview_service.stream(platform), media_type="text/event-stream")
 
 
 @router.post("/tasks/start", response_model=TaskStatusResponse)

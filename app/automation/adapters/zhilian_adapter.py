@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import re
 from collections.abc import Callable
@@ -6,6 +7,8 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from app.core.config import settings
+from app.automation.browser_factory import STEALTH_INIT_SCRIPT, build_browser_launch_options
+from app.services.live_preview_service import live_preview_service
 
 logger = logging.getLogger(__name__)
 
@@ -65,82 +68,128 @@ class ZhilianAdapter:
         should_stop: Callable[[], bool],
         status_callback: Callable[[str], None] | None = None,
         confirm_login_callback: Callable[[], bool] | None = None,
+        *,
+        task_run_id: int | None = None,
+        headless: bool | None = None,
+        live_preview_enabled: bool = False,
+        live_preview_interval_ms: int = 1000,
     ) -> None:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         from playwright.async_api import async_playwright
 
+        launch_headless = settings.browser_headless if headless is None else headless
         async with async_playwright() as playwright:
+            launch_options = build_browser_launch_options(launch_headless)
             context = await playwright.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
-                headless=settings.browser_headless,
+                **launch_options,
             )
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
             list_page = context.pages[0] if context.pages else await context.new_page()
+            preview_ref = {"page": list_page}
+            preview_task = None
+            if launch_headless and live_preview_enabled and task_run_id is not None:
+                preview_task = asyncio.create_task(
+                    self._preview_loop(
+                        context,
+                        preview_ref,
+                        should_stop,
+                        task_run_id,
+                        live_preview_interval_ms,
+                    )
+                )
             await list_page.goto(settings.zhilian_entry_url, wait_until="domcontentloaded")
-            if await self.is_login_required(list_page):
-                if status_callback:
-                    status_callback("智联招聘当前未登录，请先在浏览器中完成登录，然后回到前端点击确认已登录。")
-                await self.wait_for_login(list_page, should_stop, status_callback, confirm_login_callback)
-                if should_stop():
-                    await context.close()
-                    return
-            for search_term in search_terms:
-                if should_stop():
-                    break
-                if status_callback:
-                    status_callback(f"正在搜索关键词: {search_term}")
-                await list_page.goto(settings.zhilian_entry_url, wait_until="domcontentloaded")
-                await list_page.locator(self.selectors.keyword_input).fill("")
-                await list_page.locator(self.selectors.keyword_input).fill(search_term)
-                await list_page.locator(self.selectors.search_button).click()
-                await list_page.wait_for_timeout(10_000)
-
-                while not should_stop():
-                    cards = list_page.locator(self.selectors.job_card)
-                    count = await cards.count()
-                    if count == 0:
-                        logger.warning("No job cards found on current page.")
-                        if status_callback:
-                            status_callback(f"搜索词 {search_term} 当前页未找到岗位卡片，切换下一个搜索词。")
-                        break
-                    for index in range(count):
-                        if should_stop():
-                            break
-                        if status_callback:
-                            status_callback(f"搜索词 {search_term}：正在打开第 {index + 1} 个岗位详情")
-                        async with context.expect_page() as page_info:
-                            await cards.nth(index).click()
-                        detail_page = await page_info.value
-                        await detail_page.wait_for_load_state("domcontentloaded")
-                        await detail_page.wait_for_timeout(2500)
-                        detail_url = detail_page.url
-                        job_payload = await self.extract_job_payload(detail_page, detail_url)
-                        job_payload["search_term"] = search_term
-                        try:
-                            delivery_result = await self.try_deliver(detail_page, context)
-                            await detail_page.wait_for_timeout(5000)
-                            detect_result = await self.detect_delivery_success(context, detail_page)
-                            job_payload["delivery_success"] = detect_result["success"]
-                            job_payload["status_reason"] = self.merge_reasons(
-                                delivery_result["reason"],
-                                detect_result["reason"],
-                            )
-                        except PlaywrightTimeoutError:
-                            logger.info("Deliver button not clickable for %s", detail_url)
-                            job_payload["delivery_success"] = False
-                            job_payload["status_reason"] = "未找到可点击的立即投递按钮"
-                        finally:
-                            per_job_callback(job_payload)
-                            await self.close_extra_tabs(context, list_page)
-
-                    next_page = list_page.locator(self.selectors.next_page)
-                    if await next_page.count() == 0:
+            try:
+                if await self.is_login_required(list_page):
+                    if status_callback:
+                        status_callback("智联招聘当前未登录，请先在浏览器中完成登录，然后回到前端点击确认已登录。")
+                    await self.wait_for_login(list_page, should_stop, status_callback, confirm_login_callback)
+                    if should_stop():
+                        return
+                for search_term in search_terms:
+                    if should_stop():
                         break
                     if status_callback:
-                        status_callback(f"搜索词 {search_term} 当前页处理完成，准备进入下一页")
-                    await next_page.click()
-                    await list_page.wait_for_timeout(4000)
+                        status_callback(f"正在搜索关键词: {search_term}")
+                    preview_ref["page"] = list_page
+                    await list_page.goto(settings.zhilian_entry_url, wait_until="domcontentloaded")
+                    await list_page.locator(self.selectors.keyword_input).fill("")
+                    await list_page.locator(self.selectors.keyword_input).fill(search_term)
+                    await list_page.locator(self.selectors.search_button).click()
+                    await list_page.wait_for_timeout(10_000)
 
-            await context.close()
+                    while not should_stop():
+                        cards = list_page.locator(self.selectors.job_card)
+                        count = await cards.count()
+                        if count == 0:
+                            logger.warning("No job cards found on current page.")
+                            if status_callback:
+                                status_callback(f"搜索词 {search_term} 当前页未找到岗位卡片，切换下一个搜索词。")
+                            break
+                        for index in range(count):
+                            if should_stop():
+                                break
+                            if status_callback:
+                                status_callback(f"搜索词 {search_term}：正在打开第 {index + 1} 个岗位详情")
+                            async with context.expect_page() as page_info:
+                                await cards.nth(index).click()
+                            detail_page = await page_info.value
+                            preview_ref["page"] = detail_page
+                            await detail_page.wait_for_load_state("domcontentloaded")
+                            await detail_page.wait_for_timeout(2500)
+                            detail_url = detail_page.url
+                            job_payload = await self.extract_job_payload(detail_page, detail_url)
+                            job_payload["search_term"] = search_term
+                            try:
+                                delivery_result = await self.try_deliver(detail_page, context)
+                                await detail_page.wait_for_timeout(5000)
+                                detect_result = await self.detect_delivery_success(context, detail_page)
+                                job_payload["delivery_success"] = detect_result["success"]
+                                job_payload["status_reason"] = self.merge_reasons(
+                                    delivery_result["reason"],
+                                    detect_result["reason"],
+                                )
+                            except PlaywrightTimeoutError:
+                                logger.info("Deliver button not clickable for %s", detail_url)
+                                job_payload["delivery_success"] = False
+                                job_payload["status_reason"] = "未找到可点击的立即投递按钮"
+                            finally:
+                                per_job_callback(job_payload)
+                                await self.close_extra_tabs(context, list_page)
+                                preview_ref["page"] = list_page
+
+                        next_page = list_page.locator(self.selectors.next_page)
+                        if await next_page.count() == 0:
+                            break
+                        if status_callback:
+                            status_callback(f"搜索词 {search_term} 当前页处理完成，准备进入下一页")
+                        await next_page.click()
+                        await list_page.wait_for_timeout(4000)
+            finally:
+                if preview_task:
+                    preview_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await preview_task
+                await context.close()
+
+    async def _preview_loop(
+        self,
+        context,
+        preview_ref: dict[str, object],
+        should_stop: Callable[[], bool],
+        task_run_id: int,
+        live_preview_interval_ms: int,
+    ) -> None:
+        interval = max(500, live_preview_interval_ms) / 1000
+        while not should_stop():
+            page = preview_ref.get("page")
+            if (page is None or page.is_closed()) and context.pages:
+                page = context.pages[0]
+                preview_ref["page"] = page
+            if page is not None and not page.is_closed():
+                with contextlib.suppress(Exception):
+                    await live_preview_service.capture_page("zhilian", task_run_id, page)
+            await asyncio.sleep(interval)
 
     async def is_login_required(self, page) -> bool:
         login_link = page.locator(self.selectors.login_link)

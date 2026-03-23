@@ -13,6 +13,7 @@ from app.core.time_utils import local_now
 from app.db.database import SessionLocal
 from app.models.entities import Account, DeliveryRecord, DeliveryStatus, Job, Platform, RuleConfig, TaskLog, TaskRun, TaskStatus
 from app.schemas.common import StartTaskRequest, TaskStatusResponse
+from app.services.live_preview_service import live_preview_service
 from app.services.account_service import get_account
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,14 @@ class TaskRunner:
                     )
                 )
                 db.commit()
+                live_preview_service.start_session(
+                    payload.platform,
+                    task_id,
+                    headless_enabled=payload.headless_enabled,
+                    live_preview_enabled=payload.live_preview_enabled,
+                    interval_ms=payload.live_preview_interval_ms,
+                    current_step=task.current_step,
+                )
 
             stop_event = threading.Event()
             login_confirm_event = threading.Event()
@@ -165,6 +174,7 @@ class TaskRunner:
             self._log(payload.platform, task_run_id, "task_error", f"任务异常中断: {exc}", level="ERROR")
             self._set_status(task_run_id, TaskStatus.FAILED, f"任务执行失败: {exc}")
         finally:
+            live_preview_service.finish_session(payload.platform, task_run_id=task_run_id)
             with self._lock:
                 self._workers.pop(payload.platform.value, None)
 
@@ -188,6 +198,12 @@ class TaskRunner:
                     )
                 )
                 db.commit()
+            live_preview_service.update_status(
+                payload.platform,
+                task_run_id=task_run_id,
+                current_step=message,
+                message=message,
+            )
 
         def wait_for_login_confirmation() -> bool:
             while not stop_event.is_set():
@@ -310,6 +326,10 @@ class TaskRunner:
                             stop_event.is_set,
                             update_step,
                             wait_for_login_confirmation,
+                            task_run_id=task_run_id,
+                            headless=payload.headless_enabled,
+                            live_preview_enabled=payload.live_preview_enabled,
+                            live_preview_interval_ms=payload.live_preview_interval_ms,
                         )
                     )
                 finally:
@@ -324,6 +344,10 @@ class TaskRunner:
                         stop_event.is_set,
                         update_step,
                         wait_for_login_confirmation,
+                        task_run_id=task_run_id,
+                        headless=payload.headless_enabled,
+                        live_preview_enabled=payload.live_preview_enabled,
+                        live_preview_interval_ms=payload.live_preview_interval_ms,
                     )
                 )
         else:
@@ -454,15 +478,25 @@ class TaskRunner:
         return account
 
     def _set_status(self, task_run_id: int, status: TaskStatus, current_step: str) -> None:
+        platform_key: str | None = None
         with SessionLocal() as db:
             task = db.get(TaskRun, task_run_id)
             if not task:
                 return
+            platform_key = task.platform
             task.status = status.value
             task.current_step = current_step
             if status in {TaskStatus.STOPPED, TaskStatus.COMPLETED, TaskStatus.FAILED}:
                 task.finished_at = local_now()
             db.commit()
+        if platform_key:
+            live_preview_service.update_status(
+                platform_key,
+                task_run_id=task_run_id,
+                current_step=current_step,
+                active=status in {TaskStatus.RUNNING, TaskStatus.STOPPING},
+                message=current_step,
+            )
 
     def _log(self, platform: Platform, task_run_id: int, event_type: str, message: str, level: str = "INFO") -> None:
         with SessionLocal() as db:

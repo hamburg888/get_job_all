@@ -13,6 +13,13 @@ class Settings(BaseSettings):
     boss_entry_url: str = "https://www.zhipin.com/"
     browser_profile_root: str = "./browser_profiles"
     browser_headless: bool = False
+    browser_fake_headless: bool = True
+    browser_user_agent: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/134.0.0.0 Safari/537.36"
+    )
+    preview_frame_root: str = "./preview_frames"
 
 
 settings = Settings()

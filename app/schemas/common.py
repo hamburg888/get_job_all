@@ -17,6 +17,9 @@ class StartTaskRequest(BaseModel):
     cross_account_dedupe_enabled: bool = False
     dedupe_match_by_title: bool = True
     dedupe_match_by_company: bool = True
+    headless_enabled: bool = False
+    live_preview_enabled: bool = False
+    live_preview_interval_ms: int = 1000
     auto_send_chat: bool = False
     chat_template: str = "您好，我刚刚投递了贵司的 {job_title} 岗位，期待进一步沟通，谢谢。"
 
@@ -124,6 +127,20 @@ class StatsOut(BaseModel):
     salary_buckets: list[StatsBucketOut]
     experience_buckets: list[StatsBucketOut]
     city_buckets: list[StatsBucketOut]
+
+
+class PreviewStateOut(BaseModel):
+    platform: Platform
+    task_run_id: int | None = None
+    active: bool
+    enabled: bool
+    headless_enabled: bool
+    interval_ms: int
+    seq: int
+    frame_url: str | None = None
+    updated_at: datetime | None = None
+    current_step: str
+    message: str
 
 
 class AccountBase(BaseModel):

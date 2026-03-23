@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import sys
 
+from app.automation.browser_factory import STEALTH_INIT_SCRIPT, build_browser_launch_options
 from app.core.config import settings
 from app.models.entities import Account, Platform
 
@@ -128,10 +129,13 @@ class AccountBrowserService:
         from playwright.async_api import async_playwright
 
         async with async_playwright() as playwright:
+            # 登录配置浏览器必须可见，禁止继承任务用的无头/伪无头策略。
+            launch_options = build_browser_launch_options(False)
             context = await playwright.chromium.launch_persistent_context(
                 user_data_dir=str(profile_path),
-                headless=settings.browser_headless,
+                **launch_options,
             )
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
             try:
                 page = context.pages[0] if context.pages else await context.new_page()
                 try:
