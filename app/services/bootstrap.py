@@ -1,11 +1,34 @@
 from sqlalchemy import select
 
 from app.db.database import SessionLocal
-from app.models.entities import DeliveryRecord, DeliveryStatus, Job, Platform, RuleConfig, TaskLog, TaskRun, TaskStatus
+from app.models.entities import Account, DeliveryRecord, DeliveryStatus, Job, Platform, RuleConfig, TaskLog, TaskRun, TaskStatus
 
 
 def bootstrap_demo_data() -> None:
     with SessionLocal() as db:
+        has_account = db.scalar(select(Account.id).limit(1))
+        if not has_account:
+            accounts = [
+                Account(
+                    platform=Platform.ZHILIAN.value,
+                    phone="13800000001",
+                    username="智联账号A",
+                    remark="默认智联账号",
+                    profile_dir="browser_profiles/zhilian/account_1",
+                    is_default=True,
+                ),
+                Account(
+                    platform=Platform.BOSS.value,
+                    phone="13900000001",
+                    username="Boss账号A",
+                    remark="默认Boss账号",
+                    profile_dir="browser_profiles/boss/account_2",
+                    is_default=True,
+                ),
+            ]
+            db.add_all(accounts)
+            db.commit()
+
         has_rule = db.scalar(select(RuleConfig.id).limit(1))
         if has_rule:
             return

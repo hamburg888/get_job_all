@@ -2,16 +2,18 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import timedelta
 import sys
 
 from sqlalchemy import desc, select
 
 from app.automation.adapters.zhilian_adapter import ZhilianAdapter
 from app.core.config import settings
+from app.core.time_utils import local_now
 from app.db.database import SessionLocal
-from app.models.entities import DeliveryRecord, DeliveryStatus, Job, Platform, RuleConfig, TaskLog, TaskRun, TaskStatus
+from app.models.entities import Account, DeliveryRecord, DeliveryStatus, Job, Platform, RuleConfig, TaskLog, TaskRun, TaskStatus
 from app.schemas.common import StartTaskRequest, TaskStatusResponse
+from app.services.account_service import get_account
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ class TaskRunner:
                 return self.status(payload.platform)
 
             with SessionLocal() as db:
+                account = self._resolve_account(db, payload)
                 auto_send_chat = payload.auto_send_chat if payload.platform == Platform.BOSS else False
                 chat_template = payload.chat_template if payload.platform == Platform.BOSS else ""
                 rule = db.scalar(select(RuleConfig).where(RuleConfig.platform == platform_key).limit(1))
@@ -46,6 +49,9 @@ class TaskRunner:
                     rule.salary_min = payload.salary_min
                     rule.salary_max = payload.salary_max
                     rule.cooldown_days = payload.cooldown_days
+                    rule.cross_account_dedupe_enabled = payload.cross_account_dedupe_enabled
+                    rule.dedupe_match_by_title = payload.dedupe_match_by_title
+                    rule.dedupe_match_by_company = payload.dedupe_match_by_company
                     rule.auto_send_chat = auto_send_chat
                     rule.chat_template = chat_template
                 else:
@@ -56,12 +62,16 @@ class TaskRunner:
                         salary_min=payload.salary_min,
                         salary_max=payload.salary_max,
                         cooldown_days=payload.cooldown_days,
+                        cross_account_dedupe_enabled=payload.cross_account_dedupe_enabled,
+                        dedupe_match_by_title=payload.dedupe_match_by_title,
+                        dedupe_match_by_company=payload.dedupe_match_by_company,
                         auto_send_chat=auto_send_chat,
                         chat_template=chat_template,
                     )
                     db.add(rule)
 
                 task = TaskRun(
+                    account_id=account.id if account else None,
                     platform=platform_key,
                     keyword=",".join(payload.search_terms),
                     status=TaskStatus.RUNNING.value,
@@ -73,7 +83,14 @@ class TaskRunner:
                 db.add(task)
                 db.flush()
                 task_id = task.id
-                db.add(TaskLog(platform=platform_key, task_run_id=task_id, event_type="task_start", message="任务已启动"))
+                db.add(
+                    TaskLog(
+                        platform=platform_key,
+                        task_run_id=task_id,
+                        event_type="task_start",
+                        message=f"任务已启动，账号: {account.username if account else '未指定'}",
+                    )
+                )
                 db.commit()
 
             stop_event = threading.Event()
@@ -122,6 +139,7 @@ class TaskRunner:
                 started_at=task.started_at,
                 task_run_id=task.id,
                 waiting_for_login=waiting_for_login,
+                account_id=task.account_id,
             )
 
     def confirm_login(self, platform: Platform) -> TaskStatusResponse:
@@ -152,6 +170,9 @@ class TaskRunner:
 
     def _run_zhilian(self, task_run_id: int, payload: StartTaskRequest, stop_event: threading.Event) -> None:
         adapter = ZhilianAdapter()
+        with SessionLocal() as db:
+            account = self._resolve_account(db, payload)
+
         def update_step(message: str) -> None:
             with SessionLocal() as db:
                 task = db.get(TaskRun, task_run_id)
@@ -240,6 +261,7 @@ class TaskRunner:
                 delivery = DeliveryRecord(
                     job_id=job.id,
                     task_run_id=task.id,
+                    account_id=task.account_id,
                     platform=payload.platform.value,
                     status=delivery_status,
                     status_reason=status_reason,
@@ -283,6 +305,7 @@ class TaskRunner:
                     loop.run_until_complete(
                         adapter.run_search_flow(
                             payload.search_terms,
+                            account.profile_dir,
                             process_job,
                             stop_event.is_set,
                             update_step,
@@ -296,6 +319,7 @@ class TaskRunner:
                 asyncio.run(
                     adapter.run_search_flow(
                         payload.search_terms,
+                        account.profile_dir,
                         process_job,
                         stop_event.is_set,
                         update_step,
@@ -342,6 +366,7 @@ class TaskRunner:
                 delivery = DeliveryRecord(
                     job_id=job.id,
                     task_run_id=task.id,
+                    account_id=task.account_id,
                     platform=payload.platform.value,
                     status=DeliveryStatus.DELIVERED.value if sent_chat else DeliveryStatus.SKIPPED.value,
                     status_reason=reason,
@@ -356,6 +381,10 @@ class TaskRunner:
             time.sleep(1.5)
 
     def _match_filters(self, job_payload: dict, payload: StartTaskRequest) -> dict[str, str | bool]:
+        shared_result = self._match_cross_account_dedupe(job_payload, payload)
+        if shared_result is not None:
+            return shared_result
+
         if payload.cities:
             job_city = (job_payload.get("city") or "").strip()
             if job_city and job_city not in payload.cities:
@@ -375,6 +404,55 @@ class TaskRunner:
 
         return {"matched": True, "reason": "命中过滤条件"}
 
+    def _match_cross_account_dedupe(self, job_payload: dict, payload: StartTaskRequest) -> dict[str, str | bool] | None:
+        if not payload.cross_account_dedupe_enabled or not payload.account_id:
+            return None
+
+        compare_title = (job_payload.get("title") or "").strip()
+        compare_company = (job_payload.get("company_name") or "").strip()
+        threshold = local_now() - timedelta(days=payload.cooldown_days)
+
+        with SessionLocal() as db:
+            stmt = (
+                select(DeliveryRecord, Job)
+                .join(Job, DeliveryRecord.job_id == Job.id)
+                .where(
+                    DeliveryRecord.platform == payload.platform.value,
+                    DeliveryRecord.status == DeliveryStatus.DELIVERED.value,
+                    DeliveryRecord.account_id.is_not(None),
+                    DeliveryRecord.account_id != payload.account_id,
+                    DeliveryRecord.created_at >= threshold,
+                )
+                .order_by(desc(DeliveryRecord.created_at))
+            )
+            for delivery, job in db.execute(stmt):
+                if payload.dedupe_match_by_title and compare_title and job.title == compare_title:
+                    return {
+                        "matched": False,
+                        "reason": f"共享去重命中：账号 {delivery.account_id} 已投递同名岗位",
+                    }
+                if payload.dedupe_match_by_company and compare_company and job.company_name == compare_company:
+                    return {
+                        "matched": False,
+                        "reason": f"共享去重命中：账号 {delivery.account_id} 已投递同公司岗位",
+                    }
+        return None
+
+    def _resolve_account(self, db, payload: StartTaskRequest) -> Account:
+        account = get_account(db, payload.account_id) if payload.account_id else None
+        if account is None:
+            account = db.scalar(
+                select(Account).where(Account.platform == payload.platform.value, Account.is_default.is_(True)).limit(1)
+            )
+        if account is None:
+            raise RuntimeError(f"{payload.platform.value} 平台暂无可用账号，请先创建账号。")
+        if account.platform != payload.platform.value:
+            raise RuntimeError("所选账号与当前平台不匹配。")
+        if not account.is_active:
+            raise RuntimeError("所选账号已停用。")
+        payload.account_id = account.id
+        return account
+
     def _set_status(self, task_run_id: int, status: TaskStatus, current_step: str) -> None:
         with SessionLocal() as db:
             task = db.get(TaskRun, task_run_id)
@@ -383,7 +461,7 @@ class TaskRunner:
             task.status = status.value
             task.current_step = current_step
             if status in {TaskStatus.STOPPED, TaskStatus.COMPLETED, TaskStatus.FAILED}:
-                task.finished_at = datetime.utcnow()
+                task.finished_at = local_now()
             db.commit()
 
     def _log(self, platform: Platform, task_run_id: int, event_type: str, message: str, level: str = "INFO") -> None:

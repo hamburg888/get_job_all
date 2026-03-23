@@ -4,6 +4,7 @@ from enum import StrEnum
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.time_utils import local_now
 from app.db.database import Base
 
 
@@ -38,20 +39,24 @@ class RuleConfig(Base):
     salary_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
     salary_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cooldown_days: Mapped[int] = mapped_column(Integer, default=7)
+    cross_account_dedupe_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    dedupe_match_by_title: Mapped[bool] = mapped_column(Boolean, default=True)
+    dedupe_match_by_company: Mapped[bool] = mapped_column(Boolean, default=True)
     auto_send_chat: Mapped[bool] = mapped_column(Boolean, default=False)
     chat_template: Mapped[str] = mapped_column(
         Text,
         default="您好，我刚刚投递了贵司的 {job_title} 岗位，期待进一步沟通，谢谢。",
     )
     active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=local_now, onupdate=local_now)
 
 
 class TaskRun(Base):
     __tablename__ = "task_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
     platform: Mapped[str] = mapped_column(String(20), index=True)
     keyword: Mapped[str] = mapped_column(String(120))
     status: Mapped[str] = mapped_column(String(20), default=TaskStatus.IDLE.value)
@@ -59,11 +64,30 @@ class TaskRun(Base):
     processed_count: Mapped[int] = mapped_column(Integer, default=0)
     delivered_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    account: Mapped["Account | None"] = relationship(back_populates="task_runs")
     jobs: Mapped[list["Job"]] = relationship(back_populates="task_run")
     deliveries: Mapped[list["DeliveryRecord"]] = relationship(back_populates="task_run")
+
+
+class Account(Base):
+    __tablename__ = "accounts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(20), index=True)
+    phone: Mapped[str] = mapped_column(String(30), default="")
+    username: Mapped[str] = mapped_column(String(120), default="")
+    remark: Mapped[str] = mapped_column(String(255), default="")
+    profile_dir: Mapped[str] = mapped_column(String(255), default="")
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=local_now, onupdate=local_now)
+
+    task_runs: Mapped[list["TaskRun"]] = relationship(back_populates="account")
+    deliveries: Mapped[list["DeliveryRecord"]] = relationship(back_populates="account")
 
 
 class Job(Base):
@@ -83,10 +107,10 @@ class Job(Base):
     detail_url: Mapped[str] = mapped_column(Text, default="")
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     latest_status: Mapped[str] = mapped_column(String(20), default=DeliveryStatus.PENDING.value)
-    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
     task_run_id: Mapped[int | None] = mapped_column(ForeignKey("task_runs.id"), nullable=True)
 
-    task_run: Mapped[TaskRun | None] = relationship(back_populates="jobs")
+    task_run: Mapped["TaskRun | None"] = relationship(back_populates="jobs")
     deliveries: Mapped[list["DeliveryRecord"]] = relationship(back_populates="job")
 
 
@@ -96,15 +120,17 @@ class DeliveryRecord(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"))
     task_run_id: Mapped[int] = mapped_column(ForeignKey("task_runs.id"))
+    account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
     platform: Mapped[str] = mapped_column(String(20), index=True)
     status: Mapped[str] = mapped_column(String(20), default=DeliveryStatus.PENDING.value)
     status_reason: Mapped[str] = mapped_column(String(255), default="")
     chat_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     chat_message: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
 
     job: Mapped[Job] = relationship(back_populates="deliveries")
     task_run: Mapped[TaskRun] = relationship(back_populates="deliveries")
+    account: Mapped["Account | None"] = relationship(back_populates="deliveries")
 
 
 class TaskLog(Base):
@@ -117,4 +143,4 @@ class TaskLog(Base):
     event_type: Mapped[str] = mapped_column(String(40), default="info")
     message: Mapped[str] = mapped_column(Text)
     extra_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)

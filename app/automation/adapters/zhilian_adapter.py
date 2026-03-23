@@ -5,9 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from app.automation.browser_profiles import ensure_profile_dir
 from app.core.config import settings
-from app.models.entities import Platform
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +22,7 @@ class ZhilianSelectors:
     description: str = "div.describtion__detail-content"
     company: str = "a.company__title"
     tag_items: str = "div.describtion__skills span.describtion__skills-item"
+    action_container: str = "div.summary-plane__action"
     deliver_button: str = 'button.a-button.a--bordered.a--filled:has-text("立即投递")'
     delivered_button: str = 'button.a-button.a--bordered.a--filled.a--disabled:has-text("已投递")'
     success_dialog_main: str = "span.deliver-title__left__word"
@@ -61,6 +60,7 @@ class ZhilianAdapter:
     async def run_search_flow(
         self,
         search_terms: list[str],
+        profile_dir: str,
         per_job_callback: Callable[[dict], None],
         should_stop: Callable[[], bool],
         status_callback: Callable[[str], None] | None = None,
@@ -71,7 +71,7 @@ class ZhilianAdapter:
 
         async with async_playwright() as playwright:
             context = await playwright.chromium.launch_persistent_context(
-                user_data_dir=str(ensure_profile_dir(Platform.ZHILIAN)),
+                user_data_dir=profile_dir,
                 headless=settings.browser_headless,
             )
             list_page = context.pages[0] if context.pages else await context.new_page()
@@ -102,9 +102,7 @@ class ZhilianAdapter:
                         if status_callback:
                             status_callback(f"搜索词 {search_term} 当前页未找到岗位卡片，切换下一个搜索词。")
                         break
-                    # Temporary test mode: only process the first job on each page,
-                    # then jump to the next page to verify pagination flow.
-                    for index in range(min(count, 1)):
+                    for index in range(count):
                         if should_stop():
                             break
                         if status_callback:
@@ -113,15 +111,19 @@ class ZhilianAdapter:
                             await cards.nth(index).click()
                         detail_page = await page_info.value
                         await detail_page.wait_for_load_state("domcontentloaded")
+                        await detail_page.wait_for_timeout(2500)
                         detail_url = detail_page.url
                         job_payload = await self.extract_job_payload(detail_page, detail_url)
                         job_payload["search_term"] = search_term
                         try:
-                            await detail_page.locator(self.selectors.deliver_button).click(timeout=5000)
-                            await detail_page.wait_for_timeout(2000)
-                            delivery_result = await self.detect_delivery_success(context, detail_page)
-                            job_payload["delivery_success"] = delivery_result["success"]
-                            job_payload["status_reason"] = delivery_result["reason"]
+                            delivery_result = await self.try_deliver(detail_page, context)
+                            await detail_page.wait_for_timeout(5000)
+                            detect_result = await self.detect_delivery_success(context, detail_page)
+                            job_payload["delivery_success"] = detect_result["success"]
+                            job_payload["status_reason"] = self.merge_reasons(
+                                delivery_result["reason"],
+                                detect_result["reason"],
+                            )
                         except PlaywrightTimeoutError:
                             logger.info("Deliver button not clickable for %s", detail_url)
                             job_payload["delivery_success"] = False
@@ -148,20 +150,99 @@ class ZhilianAdapter:
         return bool(href and "passport.zhaopin.com/login" in href)
 
     async def detect_delivery_success(self, context, detail_page) -> dict:
+        delivered_button = detail_page.locator(self.selectors.delivered_button)
+        if await delivered_button.count():
+            return {"success": True, "reason": "成功检测：投递按钮已变更为已投递"}
+
         for page in context.pages:
             main_success = page.locator(self.selectors.success_dialog_main)
             if await main_success.count() and "投递成功" in await main_success.first.inner_text():
-                return {"success": True, "reason": "检测到投递成功弹窗"}
+                return {"success": True, "reason": "成功检测：检测到投递成功弹窗"}
 
             secondary_success = page.locator(self.selectors.success_dialog_secondary)
             if await secondary_success.count() and "投递成功" in await secondary_success.first.inner_text():
-                return {"success": True, "reason": "检测到投递成功对话框"}
+                return {"success": True, "reason": "成功检测：检测到投递成功对话框"}
 
+        button_snapshot = await self.inspect_deliver_button(detail_page)
+        return {"success": False, "reason": f"未检测到投递成功标识 | {button_snapshot}"}
+
+    async def try_deliver(self, detail_page, context) -> dict:
         delivered_button = detail_page.locator(self.selectors.delivered_button)
         if await delivered_button.count():
-            return {"success": True, "reason": "投递按钮已变更为已投递"}
+            return {"success": True, "reason": "点击前检测：进入详情时岗位已是已投递状态"}
 
-        return {"success": False, "reason": "未检测到投递成功标识"}
+        await detail_page.bring_to_front()
+        action_container = detail_page.locator(self.selectors.action_container)
+        if await action_container.count():
+            await action_container.first.scroll_into_view_if_needed()
+        await detail_page.wait_for_timeout(1200)
+
+        button = detail_page.locator(self.selectors.deliver_button).first
+        before_snapshot = await self.inspect_deliver_button(detail_page)
+        await button.wait_for(state="visible", timeout=8000)
+        await button.scroll_into_view_if_needed()
+        await button.hover()
+
+        try:
+            await button.click(timeout=5000)
+            result = await self.evaluate_click_attempt(detail_page, context, before_snapshot, "普通点击")
+            if result is not None:
+                return result
+        except Exception:  # noqa: BLE001
+            logger.warning("Normal deliver click failed.", exc_info=True)
+
+        final_snapshot = await self.inspect_deliver_button(detail_page)
+        return {
+            "success": False,
+            "reason": (
+                f"单次点击未触发状态变化 | 点击前：{before_snapshot} | 点击后：{final_snapshot}"
+            ),
+        }
+
+    async def evaluate_click_attempt(self, detail_page, context, before_snapshot: str, click_mode: str) -> dict | None:
+        await detail_page.wait_for_timeout(1200)
+        detect_result = await self.detect_delivery_success(context, detail_page)
+        after_snapshot = await self.inspect_deliver_button(detail_page)
+        if detect_result["success"] or after_snapshot != before_snapshot:
+            return {
+                "success": True,
+                "reason": (
+                    f"点击方式：{click_mode} | 点击前：{before_snapshot} | 点击后：{after_snapshot} | {detect_result['reason']}"
+                ),
+            }
+        return None
+
+    async def inspect_deliver_button(self, detail_page) -> str:
+        deliver_buttons = detail_page.locator(self.selectors.deliver_button)
+        deliver_count = await deliver_buttons.count()
+        delivered_buttons = detail_page.locator(self.selectors.delivered_button)
+        delivered_count = await delivered_buttons.count()
+        action_container = detail_page.locator(self.selectors.action_container)
+        action_count = await action_container.count()
+
+        if deliver_count:
+            button = deliver_buttons.first
+            try:
+                text = (await button.inner_text()).strip()
+            except Exception:  # noqa: BLE001
+                text = "<unreadable>"
+            try:
+                disabled = await button.is_disabled()
+            except Exception:  # noqa: BLE001
+                disabled = False
+            return (
+                f"action_count={action_count}, deliver_count={deliver_count}, delivered_count={delivered_count}, "
+                f"text={text}, disabled={disabled}"
+            )
+
+        return (
+            f"action_count={action_count}, deliver_count={deliver_count}, delivered_count={delivered_count}, "
+            "text=<missing>, disabled=<unknown>"
+        )
+
+    @staticmethod
+    def merge_reasons(click_reason: str, detect_reason: str) -> str:
+        return f"{click_reason} | {detect_reason}"
 
     async def wait_for_login(
         self,

@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://127.0.0.1:5173", "http://localhost:5173"]
     log_level: str = "INFO"
     zhilian_entry_url: str = "https://www.zhaopin.com/sou/jl763/p1"
+    boss_entry_url: str = "https://www.zhipin.com/"
     browser_profile_root: str = "./browser_profiles"
     browser_headless: bool = False
 
