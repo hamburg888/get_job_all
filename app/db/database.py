@@ -1,3 +1,4 @@
+import json
 from collections.abc import Generator
 
 from sqlalchemy import create_engine
@@ -10,7 +11,12 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_engine(settings.database_url, connect_args={"check_same_thread": False})
+engine = create_engine(
+    settings.database_url,
+    connect_args={"check_same_thread": False},
+    json_serializer=lambda value: json.dumps(value, ensure_ascii=False),
+    json_deserializer=json.loads,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 

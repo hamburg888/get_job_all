@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     zhilian_entry_url: str = "https://www.zhaopin.com/sou/jl763/p1"
     boss_entry_url: str = "https://www.zhipin.com/"
+    boss_jobs_url: str = "https://www.zhipin.com/web/geek/jobs"
+    boss_chat_url: str = "https://www.zhipin.com/web/geek/chat"
+    boss_login_url: str = "https://www.zhipin.com/web/user/?ka=header-login"
     browser_profile_root: str = "./browser_profiles"
     browser_headless: bool = False
     browser_fake_headless: bool = True
@@ -20,6 +23,7 @@ class Settings(BaseSettings):
         "Chrome/134.0.0.0 Safari/537.36"
     )
     preview_frame_root: str = "./preview_frames"
+    upload_root: str = "./uploads"
 
 
 settings = Settings()

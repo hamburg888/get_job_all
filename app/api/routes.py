@@ -1,7 +1,12 @@
+import base64
+from pathlib import Path
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.database import get_db
 from app.models.entities import Platform
 from app.schemas.common import (
@@ -22,6 +27,8 @@ from app.schemas.common import (
     StatsOut,
     StopTaskRequest,
     TaskStatusResponse,
+    UploadImageRequest,
+    UploadedFileOut,
 )
 from app.services.account_browser_service import account_browser_service
 from app.services.account_service import create_account, get_account, list_accounts, set_default_account, update_account
@@ -74,6 +81,34 @@ def open_account_browser_config(account_id: int, db: Session = Depends(get_db)) 
 @router.post("/accounts/{account_id}/browser-config/close", response_model=BrowserConfigSessionOut)
 def close_account_browser_config(account_id: int) -> dict:
     return account_browser_service.close_for_account(account_id)
+
+
+@router.post("/uploads/boss-chat-image", response_model=UploadedFileOut)
+def upload_boss_chat_image(payload: UploadImageRequest) -> dict:
+    suffix = Path(payload.file_name or "").suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
+        suffix = ".png"
+
+    target_dir = Path(settings.upload_root).resolve() / "boss_chat_images"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / f"{uuid4().hex}{suffix}"
+
+    try:
+        file_bytes = base64.b64decode(payload.content_base64, validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Invalid image payload") from exc
+
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty image payload")
+
+    with target_path.open("wb") as buffer:
+        buffer.write(file_bytes)
+
+    return {
+        "path": str(target_path),
+        "name": payload.file_name or target_path.name,
+        "url": f"/uploads/boss_chat_images/{target_path.name}",
+    }
 
 
 @router.get("/dashboard/overview/{platform}", response_model=OverviewOut)

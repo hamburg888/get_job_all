@@ -29,6 +29,13 @@ class DeliveryStatus(StrEnum):
     FAILED = "failed"
 
 
+class ChatSendStatus(StrEnum):
+    PENDING = "pending"
+    SENT = "sent"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
 class RuleConfig(Base):
     __tablename__ = "rule_configs"
 
@@ -65,6 +72,7 @@ class TaskRun(Base):
     delivered_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+    current_step_started_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     account: Mapped["Account | None"] = relationship(back_populates="task_runs")
@@ -124,6 +132,8 @@ class DeliveryRecord(Base):
     platform: Mapped[str] = mapped_column(String(20), index=True)
     status: Mapped[str] = mapped_column(String(20), default=DeliveryStatus.PENDING.value)
     status_reason: Mapped[str] = mapped_column(String(255), default="")
+    send_status: Mapped[str] = mapped_column(String(20), default=ChatSendStatus.SKIPPED.value)
+    chat_hr_name: Mapped[str] = mapped_column(String(120), default="")
     chat_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     chat_message: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)

@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from app.core.config import settings
-from app.automation.browser_factory import STEALTH_INIT_SCRIPT, build_browser_launch_options
+from app.automation.browser_factory import (
+    LAODENG_INIT_SCRIPT,
+    STEALTH_INIT_SCRIPT,
+    build_browser_launch_options,
+)
 from app.services.live_preview_service import live_preview_service
 
 logger = logging.getLogger(__name__)
@@ -69,15 +73,21 @@ class ZhilianAdapter:
         status_callback: Callable[[str], None] | None = None,
         confirm_login_callback: Callable[[], bool] | None = None,
         *,
+        entry_url: str | None = None,
         task_run_id: int | None = None,
         headless: bool | None = None,
         live_preview_enabled: bool = False,
         live_preview_interval_ms: int = 1000,
+        delivery_interval_seconds: int = 3,
+        max_deliveries_per_run: int = 100,
     ) -> None:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         from playwright.async_api import async_playwright
 
         launch_headless = settings.browser_headless if headless is None else headless
+        target_entry_url = (entry_url or settings.zhilian_entry_url).strip() or settings.zhilian_entry_url
+        use_manual_entry_url = bool(entry_url and entry_url.strip())
+        effective_search_terms = search_terms if search_terms else [""]
         async with async_playwright() as playwright:
             launch_options = build_browser_launch_options(launch_headless)
             context = await playwright.chromium.launch_persistent_context(
@@ -85,6 +95,7 @@ class ZhilianAdapter:
                 **launch_options,
             )
             await context.add_init_script(STEALTH_INIT_SCRIPT)
+            await context.add_init_script(LAODENG_INIT_SCRIPT)
             list_page = context.pages[0] if context.pages else await context.new_page()
             preview_ref = {"page": list_page}
             preview_task = None
@@ -98,7 +109,7 @@ class ZhilianAdapter:
                         live_preview_interval_ms,
                     )
                 )
-            await list_page.goto(settings.zhilian_entry_url, wait_until="domcontentloaded")
+            await list_page.goto(target_entry_url, wait_until="domcontentloaded")
             try:
                 if await self.is_login_required(list_page):
                     if status_callback:
@@ -106,17 +117,22 @@ class ZhilianAdapter:
                     await self.wait_for_login(list_page, should_stop, status_callback, confirm_login_callback)
                     if should_stop():
                         return
-                for search_term in search_terms:
+                for search_term in effective_search_terms:
                     if should_stop():
                         break
-                    if status_callback:
+                    if status_callback and use_manual_entry_url:
+                        status_callback("正在打开手动配置的筛选 URL")
+                    elif status_callback:
                         status_callback(f"正在搜索关键词: {search_term}")
                     preview_ref["page"] = list_page
-                    await list_page.goto(settings.zhilian_entry_url, wait_until="domcontentloaded")
-                    await list_page.locator(self.selectors.keyword_input).fill("")
-                    await list_page.locator(self.selectors.keyword_input).fill(search_term)
-                    await list_page.locator(self.selectors.search_button).click()
-                    await list_page.wait_for_timeout(10_000)
+                    await list_page.goto(target_entry_url, wait_until="domcontentloaded")
+                    if use_manual_entry_url:
+                        await list_page.wait_for_timeout(6000)
+                    else:
+                        await list_page.locator(self.selectors.keyword_input).fill("")
+                        await list_page.locator(self.selectors.keyword_input).fill(search_term)
+                        await list_page.locator(self.selectors.search_button).click()
+                        await list_page.wait_for_timeout(10_000)
 
                     while not should_stop():
                         cards = list_page.locator(self.selectors.job_card)
@@ -139,7 +155,7 @@ class ZhilianAdapter:
                             await detail_page.wait_for_timeout(2500)
                             detail_url = detail_page.url
                             job_payload = await self.extract_job_payload(detail_page, detail_url)
-                            job_payload["search_term"] = search_term
+                            job_payload["search_term"] = search_term or "手动URL"
                             try:
                                 delivery_result = await self.try_deliver(detail_page, context)
                                 await detail_page.wait_for_timeout(5000)

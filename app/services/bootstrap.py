@@ -1,7 +1,18 @@
 from sqlalchemy import select
 
 from app.db.database import SessionLocal
-from app.models.entities import Account, DeliveryRecord, DeliveryStatus, Job, Platform, RuleConfig, TaskLog, TaskRun, TaskStatus
+from app.models.entities import (
+    Account,
+    ChatSendStatus,
+    DeliveryRecord,
+    DeliveryStatus,
+    Job,
+    Platform,
+    RuleConfig,
+    TaskLog,
+    TaskRun,
+    TaskStatus,
+)
 
 
 def bootstrap_demo_data() -> None:
@@ -94,6 +105,8 @@ def bootstrap_demo_data() -> None:
                 platform=Platform.BOSS.value,
                 status=DeliveryStatus.DELIVERED.value,
                 status_reason="已投递，自动发送问候语成功",
+                send_status=ChatSendStatus.SENT.value,
+                chat_hr_name="张主管",
                 chat_sent=True,
                 chat_message="您好，我刚刚投递了贵司的 Python后端开发 岗位。",
             ),
@@ -103,6 +116,8 @@ def bootstrap_demo_data() -> None:
                 platform=Platform.BOSS.value,
                 status=DeliveryStatus.FAILED.value,
                 status_reason="岗位已关闭",
+                send_status=ChatSendStatus.SKIPPED.value,
+                chat_hr_name="",
                 chat_sent=False,
             ),
         ]

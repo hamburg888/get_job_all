@@ -1,3 +1,5 @@
+import json
+
 from sqlalchemy import inspect, text
 
 from app.db.database import engine
@@ -37,7 +39,10 @@ def run_migrations() -> None:
 
     additions = [
         ("task_runs", "account_id", "INTEGER"),
+        ("task_runs", "current_step_started_at", "DATETIME"),
         ("delivery_records", "account_id", "INTEGER"),
+        ("delivery_records", "send_status", "VARCHAR(20) DEFAULT 'skipped'"),
+        ("delivery_records", "chat_hr_name", "VARCHAR(120) DEFAULT ''"),
         ("rule_configs", "cross_account_dedupe_enabled", "BOOLEAN DEFAULT 0"),
         ("rule_configs", "dedupe_match_by_title", "BOOLEAN DEFAULT 1"),
         ("rule_configs", "dedupe_match_by_company", "BOOLEAN DEFAULT 1"),
@@ -53,3 +58,49 @@ def run_migrations() -> None:
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+        if _has_column("task_runs", "current_step_started_at"):
+            connection.execute(
+                text(
+                    """
+                    UPDATE task_runs
+                    SET current_step_started_at = COALESCE(current_step_started_at, started_at, CURRENT_TIMESTAMP)
+                    WHERE current_step_started_at IS NULL
+                    """
+                )
+            )
+
+    _normalize_json_columns()
+
+
+def _normalize_json_columns() -> None:
+    targets = [
+        ("jobs", "tags"),
+        ("task_logs", "extra_json"),
+    ]
+
+    with engine.begin() as connection:
+        for table_name, column_name in targets:
+            if not _has_column(table_name, column_name):
+                continue
+            rows = connection.execute(
+                text(
+                    f"""
+                    SELECT id, {column_name}
+                    FROM {table_name}
+                    WHERE {column_name} IS NOT NULL
+                      AND CAST({column_name} AS TEXT) LIKE '%\\u%'
+                    """
+                )
+            ).fetchall()
+            for row_id, raw_value in rows:
+                if raw_value is None:
+                    continue
+                try:
+                    parsed_value = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+                    normalized_value = json.dumps(parsed_value, ensure_ascii=False)
+                except Exception:
+                    continue
+                connection.execute(
+                    text(f"UPDATE {table_name} SET {column_name} = :value WHERE id = :row_id"),
+                    {"value": normalized_value, "row_id": row_id},
+                )

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -10,6 +12,8 @@ from app.db.migrations import run_migrations
 from app.services.bootstrap import bootstrap_demo_data
 
 configure_logging()
+Path(settings.preview_frame_root).mkdir(parents=True, exist_ok=True)
+Path(settings.upload_root).mkdir(parents=True, exist_ok=True)
 Base.metadata.create_all(bind=engine)
 run_migrations()
 bootstrap_demo_data()
@@ -30,6 +34,7 @@ app.add_middleware(
 
 app.include_router(router, prefix="/api")
 app.mount("/preview_frames", StaticFiles(directory=settings.preview_frame_root), name="preview_frames")
+app.mount("/uploads", StaticFiles(directory=settings.upload_root), name="uploads")
 
 
 @app.get("/")

@@ -1,9 +1,66 @@
 from collections import Counter
+import re
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.models.entities import Account, DeliveryRecord, DeliveryStatus, Job, Platform, TaskLog, TaskRun, TaskStatus
+
+BOSS_SALARY_FONT_MAP = str.maketrans(
+    {
+        ord("\uE030"): "0",
+        ord("\uE031"): "1",
+        ord("\uE032"): "2",
+        ord("\uE033"): "3",
+        ord("\uE034"): "4",
+        ord("\uE035"): "5",
+        ord("\uE036"): "6",
+        ord("\uE037"): "7",
+        ord("\uE038"): "8",
+        ord("\uE039"): "9",
+        ord("\uE8F0"): "0",
+        ord("\uE8F1"): "1",
+        ord("\uE8F2"): "2",
+        ord("\uE8F3"): "3",
+        ord("\uE8F4"): "4",
+        ord("\uE8F5"): "5",
+        ord("\uE8F6"): "6",
+        ord("\uE8F7"): "7",
+        ord("\uE8F8"): "8",
+        ord("\uE8F9"): "9",
+    }
+)
+
+
+def _decode_salary_text(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = re.sub(r"\s+", " ", value).strip()
+    return normalized.translate(BOSS_SALARY_FONT_MAP)
+
+
+def _parse_salary_part(value: str) -> float | None:
+    digits = re.findall(r"\d+(?:\.\d+)?", value)
+    if not digits:
+        return None
+    number = float(digits[0])
+    normalized = value.lower()
+    if "w" in normalized:
+        return number * 10
+    if "k" in normalized:
+        return number
+    return number / 1000 if number > 1000 else number
+
+
+def _normalize_salary(raw_salary: str) -> tuple[float | None, float | None]:
+    salary = _decode_salary_text(raw_salary).replace("元", "").replace("万", "w").replace("K", "k").strip()
+    if not salary:
+        return None, None
+    if "-" not in salary:
+        value = _parse_salary_part(salary)
+        return value, value
+    left, right = salary.split("-", maxsplit=1)
+    return _parse_salary_part(left), _parse_salary_part(right)
 
 
 def _serialize_jobs(db: Session, jobs: list[Job]) -> list[dict]:
@@ -31,6 +88,15 @@ def _serialize_jobs(db: Session, jobs: list[Job]) -> list[dict]:
     for job in jobs:
         latest_delivery = latest_delivery_map.get(job.id)
         account = account_map.get(latest_delivery.account_id) if latest_delivery and latest_delivery.account_id else None
+        salary_text = _decode_salary_text(job.salary_text)
+        salary_min = job.salary_min
+        salary_max = job.salary_max
+        if salary_min is None or salary_max is None:
+            fallback_min, fallback_max = _normalize_salary(salary_text)
+            if salary_min is None:
+                salary_min = fallback_min
+            if salary_max is None:
+                salary_max = fallback_max
         items.append(
             {
                 "id": job.id,
@@ -40,17 +106,20 @@ def _serialize_jobs(db: Session, jobs: list[Job]) -> list[dict]:
                 "account_name": (account.username or account.phone) if account else None,
                 "title": job.title,
                 "company_name": job.company_name,
-                "salary_text": job.salary_text,
-                "salary_min": job.salary_min,
-                "salary_max": job.salary_max,
+                "salary_text": salary_text or job.salary_text,
+                "salary_min": salary_min,
+                "salary_max": salary_max,
                 "city": job.city,
                 "experience_text": job.experience_text,
+                "description": job.description,
                 "detail_url": job.detail_url,
                 "tags": job.tags,
                 "latest_status": job.latest_status,
                 "discovered_at": job.discovered_at,
                 "delivered_at": latest_delivery.created_at if latest_delivery else None,
                 "latest_reason": latest_delivery.status_reason if latest_delivery else None,
+                "latest_send_status": latest_delivery.send_status if latest_delivery else None,
+                "latest_chat_message": latest_delivery.chat_message if latest_delivery else None,
             }
         )
     return items
@@ -97,6 +166,7 @@ def list_deliveries(db: Session, platform: Platform, page: int = 1, page_size: i
                 "account_name": (account.username or account.phone) if account else None,
                 "status": delivery.status,
                 "status_reason": delivery.status_reason,
+                "send_status": delivery.send_status,
                 "chat_sent": delivery.chat_sent,
                 "chat_message": delivery.chat_message,
                 "created_at": delivery.created_at,
