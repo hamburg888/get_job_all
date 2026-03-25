@@ -111,6 +111,7 @@ class Job(Base):
     salary_max: Mapped[float | None] = mapped_column(Float, nullable=True)
     city: Mapped[str] = mapped_column(String(80), default="")
     experience_text: Mapped[str] = mapped_column(String(80), default="")
+    education_text: Mapped[str] = mapped_column(String(80), default="")
     description: Mapped[str] = mapped_column(Text, default="")
     detail_url: Mapped[str] = mapped_column(Text, default="")
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)

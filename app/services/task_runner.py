@@ -1,6 +1,8 @@
+import contextlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 import sys
@@ -8,7 +10,7 @@ import sys
 from sqlalchemy import desc, select
 
 from app.automation.adapters.boss_adapter import BossAdapter
-from app.automation.adapters.zhilian_adapter import ZhilianAdapter
+from app.automation.adapters.zhilian_adapter import ZhilianAdapter, ZhilianDailyLimitReached
 from app.core.config import settings
 from app.core.time_utils import local_now
 from app.db.database import SessionLocal
@@ -37,6 +39,7 @@ class WorkerState:
     stop_event: threading.Event
     login_confirm_event: threading.Event
     task_run_id: int
+    force_stop: Callable[[], None] | None = None
 
 
 class TaskRunner:
@@ -105,7 +108,37 @@ class TaskRunner:
                         message=f"任务已启动，账号: {account.username if account else '未指定'}",
                     )
                 )
+                db.add(
+                    TaskLog(
+                        platform=platform_key,
+                        task_run_id=task_id,
+                        event_type="task_config",
+                        message=(
+                            "启动参数："
+                            f"headless_enabled={payload.headless_enabled}, "
+                            f"live_preview_enabled={payload.live_preview_enabled}, "
+                            f"use_manual_entry_url={payload.use_manual_entry_url}, "
+                            f"entry_url={payload.manual_entry_url or '-'}"
+                        ),
+                        extra_json={
+                            "account_id": payload.account_id,
+                            "headless_enabled": payload.headless_enabled,
+                            "live_preview_enabled": payload.live_preview_enabled,
+                            "use_manual_entry_url": payload.use_manual_entry_url,
+                            "manual_entry_url": payload.manual_entry_url,
+                        },
+                    )
+                )
                 db.commit()
+                logger.info(
+                    "Task start payload resolved: platform=%s account_id=%s headless_enabled=%s live_preview_enabled=%s use_manual_entry_url=%s entry_url=%s",
+                    platform_key,
+                    payload.account_id,
+                    payload.headless_enabled,
+                    payload.live_preview_enabled,
+                    payload.use_manual_entry_url,
+                    payload.manual_entry_url,
+                )
                 live_preview_service.start_session(
                     payload.platform,
                     task_id,
@@ -133,6 +166,9 @@ class TaskRunner:
             worker = self._workers.get(platform.value)
             if worker:
                 worker.stop_event.set()
+                with contextlib.suppress(Exception):
+                    if worker.force_stop is not None:
+                        worker.force_stop()
                 self._set_status(worker.task_run_id, TaskStatus.STOPPING, "收到停止指令，正在收尾")
                 with SessionLocal() as db:
                     task = db.get(TaskRun, worker.task_run_id)
@@ -240,7 +276,16 @@ class TaskRunner:
             final_status = TaskStatus.STOPPED if stop_event.is_set() else TaskStatus.COMPLETED
             final_step = "任务已停止" if stop_event.is_set() else "任务执行完成"
             self._set_status(task_run_id, final_status, final_step)
+        except ZhilianDailyLimitReached as exc:
+            logger.info("Zhilian task ended due to daily delivery limit: %s", exc)
+            self._log(payload.platform, task_run_id, "task_progress", str(exc))
+            self._set_status(task_run_id, TaskStatus.COMPLETED, str(exc))
         except Exception as exc:  # noqa: BLE001
+            if stop_event.is_set():
+                logger.info("Task interrupted while stopping: %s", exc)
+                self._log(payload.platform, task_run_id, "task_progress", f"停止过程中已中断当前浏览器动作: {exc}")
+                self._set_status(task_run_id, TaskStatus.STOPPED, "任务已停止")
+                return
             logger.exception("Task failed: %s", exc)
             self._log(payload.platform, task_run_id, "task_error", f"任务异常中断: {exc}", level="ERROR")
             self._set_status(task_run_id, TaskStatus.FAILED, f"任务执行失败: {exc}")
@@ -251,6 +296,10 @@ class TaskRunner:
 
     def _run_zhilian(self, task_run_id: int, payload: StartTaskRequest, stop_event: threading.Event) -> None:
         adapter = ZhilianAdapter()
+        with self._lock:
+            worker = self._workers.get(payload.platform.value)
+            if worker and worker.task_run_id == task_run_id:
+                worker.force_stop = adapter.request_stop
         with SessionLocal() as db:
             account = self._resolve_account(db, payload)
 
@@ -296,10 +345,13 @@ class TaskRunner:
                 task.processed_count += 1
 
                 filter_result = self._match_filters(job_payload, payload)
+                already_delivered = bool(job_payload.get("already_delivered", False))
                 delivery_status = (
-                    DeliveryStatus.DELIVERED.value
-                    if filter_result["matched"] and job_payload.get("delivery_success", True)
-                    else DeliveryStatus.SKIPPED.value if not filter_result["matched"] else DeliveryStatus.FAILED.value
+                    DeliveryStatus.SKIPPED.value
+                    if not filter_result["matched"] or already_delivered
+                    else DeliveryStatus.DELIVERED.value
+                    if job_payload.get("delivery_success", True)
+                    else DeliveryStatus.FAILED.value
                 )
                 status_reason = (
                     filter_result["reason"] if not filter_result["matched"] else job_payload.get("status_reason", "职位已投递")
@@ -319,6 +371,7 @@ class TaskRunner:
                     existing_job.salary_max = job_payload.get("salary_max")
                     existing_job.city = job_payload.get("city", payload.cities[0] if payload.cities else "")
                     existing_job.experience_text = job_payload.get("experience_text", "不限")
+                    existing_job.education_text = job_payload.get("education_text", "未标注")
                     existing_job.description = job_payload["description"]
                     existing_job.detail_url = job_payload["detail_url"]
                     existing_job.tags = job_payload.get("tags", [])
@@ -336,6 +389,7 @@ class TaskRunner:
                         salary_max=job_payload.get("salary_max"),
                         city=job_payload.get("city", payload.cities[0] if payload.cities else ""),
                         experience_text=job_payload.get("experience_text", "不限"),
+                        education_text=job_payload.get("education_text", "未标注"),
                         description=job_payload["description"],
                         detail_url=job_payload["detail_url"],
                         tags=job_payload.get("tags", []),
@@ -360,6 +414,8 @@ class TaskRunner:
                 db.add(delivery)
                 if not filter_result["matched"]:
                     task.failed_count += 1
+                elif already_delivered:
+                    pass
                 elif job_payload.get("delivery_success", True):
                     task.delivered_count += 1
                 else:
@@ -435,6 +491,10 @@ class TaskRunner:
 
     def _run_boss(self, task_run_id: int, payload: StartTaskRequest, stop_event: threading.Event) -> None:
         adapter = BossAdapter()
+        with self._lock:
+            worker = self._workers.get(payload.platform.value)
+            if worker and worker.task_run_id == task_run_id:
+                worker.force_stop = adapter.request_stop
         with SessionLocal() as db:
             account = self._resolve_account(db, payload)
 
@@ -504,6 +564,7 @@ class TaskRunner:
                     existing_job.salary_max = job_payload.get("salary_max")
                     existing_job.city = job_payload.get("city", "")
                     existing_job.experience_text = job_payload.get("experience_text", "不限")
+                    existing_job.education_text = job_payload.get("education_text", "未标注")
                     existing_job.description = job_payload.get("description", "")
                     existing_job.detail_url = job_payload.get("detail_url", "")
                     existing_job.tags = job_payload.get("tags", [])
@@ -521,6 +582,7 @@ class TaskRunner:
                         salary_max=job_payload.get("salary_max"),
                         city=job_payload.get("city", ""),
                         experience_text=job_payload.get("experience_text", "不限"),
+                        education_text=job_payload.get("education_text", "未标注"),
                         description=job_payload.get("description", ""),
                         detail_url=job_payload.get("detail_url", ""),
                         tags=job_payload.get("tags", []),
@@ -686,6 +748,7 @@ class TaskRunner:
                             enable_image_resume=payload.enable_image_resume,
                             image_resume_path=payload.image_resume_path,
                             auto_agree_wechat_card=payload.auto_agree_wechat_card,
+                            boss_first_greeting_only=payload.boss_first_greeting_only,
                             enable_follow_up_reply=payload.enable_follow_up_reply,
                             follow_up_reply_rules=[rule.model_dump() for rule in payload.boss_reply_rules],
                             delivery_interval_seconds=payload.delivery_interval_seconds,
@@ -721,6 +784,7 @@ class TaskRunner:
                         enable_image_resume=payload.enable_image_resume,
                         image_resume_path=payload.image_resume_path,
                         auto_agree_wechat_card=payload.auto_agree_wechat_card,
+                        boss_first_greeting_only=payload.boss_first_greeting_only,
                         enable_follow_up_reply=payload.enable_follow_up_reply,
                         follow_up_reply_rules=[rule.model_dump() for rule in payload.boss_reply_rules],
                         delivery_interval_seconds=payload.delivery_interval_seconds,
@@ -891,21 +955,31 @@ class TaskRunner:
                     DeliveryRecord.platform == payload.platform.value,
                     DeliveryRecord.status == DeliveryStatus.DELIVERED.value,
                     DeliveryRecord.account_id.is_not(None),
-                    DeliveryRecord.account_id != payload.account_id,
                     DeliveryRecord.created_at >= threshold,
                 )
                 .order_by(desc(DeliveryRecord.created_at))
             )
             for delivery, job in db.execute(stmt):
-                if payload.dedupe_match_by_title and compare_title and job.title == compare_title:
+                account_scope = (
+                    "当前账号"
+                    if delivery.account_id == payload.account_id
+                    else f"账号 {delivery.account_id}"
+                )
+                if (
+                    payload.dedupe_match_by_title
+                    and compare_title
+                    and compare_company
+                    and job.title == compare_title
+                    and job.company_name == compare_company
+                ):
                     return {
                         "matched": False,
-                        "reason": f"共享去重命中：账号 {delivery.account_id} 已投递同名岗位",
+                        "reason": f"历史投递去重命中：{account_scope} 已投递同标题同公司岗位",
                     }
                 if payload.dedupe_match_by_company and compare_company and job.company_name == compare_company:
                     return {
                         "matched": False,
-                        "reason": f"共享去重命中：账号 {delivery.account_id} 已投递同公司岗位",
+                        "reason": f"历史投递去重命中：{account_scope} 已投递该公司岗位",
                     }
         return None
 

@@ -186,7 +186,9 @@ def build_browser_launch_options(headless: bool) -> dict:
     else:
         args.extend(
             [
+                "--window-position=120,80",
                 "--window-size=1440,760",
+                "--start-maximized",
                 "--disable-renderer-backgrounding",
                 "--disable-background-timer-throttling",
             ]
@@ -211,6 +213,7 @@ def build_visible_login_launch_options() -> dict:
         "--disable-infobars",
         "--disable-session-crashed-bubble",
         "--lang=zh-CN,zh;q=0.9,en;q=0.8",
+        "--window-position=120,80",
         "--window-size=1440,760",
         "--start-maximized",
     ]

@@ -66,6 +66,7 @@ class StartTaskRequest(BaseModel):
     enable_image_resume: bool = False
     image_resume_path: str = ""
     auto_agree_wechat_card: bool = False
+    boss_first_greeting_only: bool = False
     enable_follow_up_reply: bool = True
     boss_reply_rules: list[BossReplyRuleIn] = Field(default_factory=_default_boss_reply_rules)
     boss_active_statuses: list[str] = Field(default_factory=lambda: ["不限"])
@@ -107,6 +108,7 @@ class JobOut(BaseModel):
     salary_max: float | None
     city: str
     experience_text: str
+    education_text: str
     description: str
     detail_url: str
     tags: list[str]
@@ -180,6 +182,7 @@ class StatsOut(BaseModel):
     salary_buckets: list[StatsBucketOut]
     experience_buckets: list[StatsBucketOut]
     city_buckets: list[StatsBucketOut]
+    keyword_buckets: list[StatsBucketOut]
 
 
 class PreviewStateOut(BaseModel):

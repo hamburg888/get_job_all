@@ -2,7 +2,7 @@ import base64
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -32,7 +32,7 @@ from app.schemas.common import (
 )
 from app.services.account_browser_service import account_browser_service
 from app.services.account_service import create_account, get_account, list_accounts, set_default_account, update_account
-from app.services.dashboard_service import get_overview, get_stats, list_deliveries, list_jobs, list_logs
+from app.services.dashboard_service import DashboardFilters, get_overview, get_stats, list_deliveries, list_jobs, list_logs
 from app.services.live_preview_service import live_preview_service
 from app.services.task_runner import task_runner
 
@@ -111,14 +111,40 @@ def upload_boss_chat_image(payload: UploadImageRequest) -> dict:
     }
 
 
+def _dashboard_filters(
+    account_id: int | None = None,
+    statuses: list[str] = Query(default_factory=list),
+    send_statuses: list[str] = Query(default_factory=list),
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> DashboardFilters:
+    return DashboardFilters(
+        account_id=account_id,
+        statuses=tuple(item for item in statuses if item),
+        send_statuses=tuple(item for item in send_statuses if item),
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+
 @router.get("/dashboard/overview/{platform}", response_model=OverviewOut)
-def dashboard_overview(platform: Platform, db: Session = Depends(get_db)) -> dict:
-    return get_overview(db, platform)
+def dashboard_overview(
+    platform: Platform,
+    filters: DashboardFilters = Depends(_dashboard_filters),
+    db: Session = Depends(get_db),
+) -> dict:
+    return get_overview(db, platform, filters)
 
 
 @router.get("/dashboard/jobs/{platform}", response_model=PaginatedJobsOut)
-def dashboard_jobs(platform: Platform, page: int = 1, page_size: int = 10, db: Session = Depends(get_db)) -> dict:
-    return list_jobs(db, platform, page, page_size)
+def dashboard_jobs(
+    platform: Platform,
+    page: int = 1,
+    page_size: int = 10,
+    filters: DashboardFilters = Depends(_dashboard_filters),
+    db: Session = Depends(get_db),
+) -> dict:
+    return list_jobs(db, platform, page, page_size, filters)
 
 
 @router.get("/dashboard/deliveries/{platform}", response_model=PaginatedDeliveriesOut)
@@ -127,13 +153,22 @@ def dashboard_deliveries(platform: Platform, page: int = 1, page_size: int = 10,
 
 
 @router.get("/dashboard/logs/{platform}", response_model=list[LogOut])
-def dashboard_logs(platform: Platform, limit: int = 40, db: Session = Depends(get_db)) -> list:
-    return list_logs(db, platform, limit)
+def dashboard_logs(
+    platform: Platform,
+    limit: int = 40,
+    filters: DashboardFilters = Depends(_dashboard_filters),
+    db: Session = Depends(get_db),
+) -> list:
+    return list_logs(db, platform, limit, filters)
 
 
 @router.get("/dashboard/stats/{platform}", response_model=StatsOut)
-def dashboard_stats(platform: Platform, db: Session = Depends(get_db)) -> dict:
-    return get_stats(db, platform)
+def dashboard_stats(
+    platform: Platform,
+    filters: DashboardFilters = Depends(_dashboard_filters),
+    db: Session = Depends(get_db),
+) -> dict:
+    return get_stats(db, platform, filters)
 
 
 @router.get("/tasks/status/{platform}", response_model=TaskStatusResponse)

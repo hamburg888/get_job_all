@@ -7,6 +7,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 from collections.abc import Callable
@@ -36,6 +37,7 @@ BOSS_SALARY_FONT_MAP = str.maketrans(
         ord("\uE037"): "7",
         ord("\uE038"): "8",
         ord("\uE039"): "9",
+        ord("\uE03A"): "10",
         ord("\uE8F0"): "0",
         ord("\uE8F1"): "1",
         ord("\uE8F2"): "2",
@@ -174,6 +176,11 @@ class BossChatTask:
 class BossAdapter:
     def __init__(self) -> None:
         self.selectors = BossSelectors()
+        self._runtime_lock = threading.Lock()
+        self._active_loop = None
+        self._active_context = None
+        self._active_browser = None
+        self._active_chrome_pid: int | None = None
 
     async def run_hybrid_flow(
         self,
@@ -191,6 +198,7 @@ class BossAdapter:
         enable_image_resume: bool,
         image_resume_path: str,
         auto_agree_wechat_card: bool,
+        boss_first_greeting_only: bool,
         enable_follow_up_reply: bool,
         follow_up_reply_rules: list[dict],
         delivery_interval_seconds: int,
@@ -215,11 +223,20 @@ class BossAdapter:
         max_successful_deliveries = max(1, max_deliveries_per_run)
         successful_deliveries = 0
         delivery_interval_ms = max(0, delivery_interval_seconds) * 1000
+        launch_mode = "fake_headless" if headless and settings.browser_fake_headless else "headless" if headless else "visible"
+        use_persistent_context = bool(headless and not settings.browser_fake_headless)
+        logger.info(
+            "Boss launch mode resolved: mode=%s requested_headless=%s settings_headless=%s fake_headless=%s",
+            launch_mode,
+            headless,
+            settings.browser_headless,
+            settings.browser_fake_headless,
+        )
 
         async with async_playwright() as playwright:
             browser = None
             chrome_pid: int | None = None
-            if headless:
+            if use_persistent_context:
                 launch_options = build_browser_launch_options(headless)
                 context = await playwright.chromium.launch_persistent_context(
                     user_data_dir=profile_dir,
@@ -233,13 +250,21 @@ class BossAdapter:
                 profile_path.mkdir(parents=True, exist_ok=True)
 
                 debug_port = self._pick_free_port()
-                chrome_pid = self._launch_external_chrome(chrome_path, profile_path, debug_port, jobs_url)
-                ws_endpoint = self._wait_for_cdp_endpoint(debug_port, timeout=20)
+                chrome_pid = self._launch_external_chrome(
+                    chrome_path,
+                    profile_path,
+                    debug_port,
+                    jobs_url,
+                    launch_options=build_browser_launch_options(headless),
+                )
+                self._bind_runtime(asyncio.get_running_loop(), None, None, chrome_pid)
+                ws_endpoint = self._wait_for_cdp_endpoint(debug_port, timeout=20, should_stop=should_stop)
                 if not ws_endpoint:
                     raise RuntimeError("Boss 外部 Chrome 已启动，但未能连接到调试端口。")
                 browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
                 context = browser.contexts[0] if browser.contexts else await browser.new_context()
 
+            self._bind_runtime(asyncio.get_running_loop(), context, browser, chrome_pid)
             await context.add_init_script(STEALTH_INIT_SCRIPT)
             await context.add_init_script(LAODENG_INIT_SCRIPT)
             jobs_page, chat_page = await self._ensure_pages(context, jobs_url, chat_url)
@@ -367,6 +392,7 @@ class BossAdapter:
                         enable_image_resume,
                         image_resume_path,
                         auto_agree_wechat_card,
+                        boss_first_greeting_only,
                         enable_follow_up_reply,
                         follow_up_reply_rules,
                         should_stop,
@@ -397,13 +423,58 @@ class BossAdapter:
                     preview_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await preview_task
-                if headless:
+                with contextlib.suppress(Exception):
+                    await context.close()
+                if browser is not None:
                     with contextlib.suppress(Exception):
-                        await context.close()
-                    if browser is not None:
-                        with contextlib.suppress(Exception):
-                            await browser.close()
-                    self._terminate_chrome_process(chrome_pid)
+                        await browser.close()
+                self._clear_runtime()
+                self._terminate_chrome_process(chrome_pid)
+
+    def request_stop(self) -> None:
+        with self._runtime_lock:
+            loop = self._active_loop
+            context = self._active_context
+            browser = self._active_browser
+            chrome_pid = self._active_chrome_pid
+            self._active_chrome_pid = None
+
+        if chrome_pid:
+            self._terminate_chrome_process(chrome_pid)
+
+        if loop is None:
+            return
+
+        def _interrupt_runtime() -> None:
+            if context is not None:
+                asyncio.create_task(self._safe_close_context(context))
+            elif browser is not None:
+                asyncio.create_task(self._safe_close_browser(browser))
+
+        with contextlib.suppress(Exception):
+            loop.call_soon_threadsafe(_interrupt_runtime)
+
+    def _bind_runtime(self, loop, context, browser, chrome_pid: int | None) -> None:
+        with self._runtime_lock:
+            self._active_loop = loop
+            self._active_context = context
+            self._active_browser = browser
+            self._active_chrome_pid = chrome_pid
+
+    def _clear_runtime(self) -> None:
+        with self._runtime_lock:
+            self._active_loop = None
+            self._active_context = None
+            self._active_browser = None
+            self._active_chrome_pid = None
+
+    async def _safe_close_context(self, context) -> None:
+        with contextlib.suppress(Exception):
+            await context.close()
+
+    async def _safe_close_browser(self, browser) -> None:
+        with contextlib.suppress(Exception):
+            await browser.close()
 
     async def _prime_chat_conversations(
         self,
@@ -454,6 +525,7 @@ class BossAdapter:
             enable_image_resume=False,
             image_resume_path="",
             auto_agree_wechat_card=False,
+            boss_first_greeting_only=False,
             enable_follow_up_reply=True,
             follow_up_reply_rules=[],
             delivery_interval_seconds=3,
@@ -573,6 +645,7 @@ class BossAdapter:
         enable_image_resume: bool,
         image_resume_path: str,
         auto_agree_wechat_card: bool,
+        boss_first_greeting_only: bool,
         enable_follow_up_reply: bool,
         follow_up_reply_rules: list[dict],
         should_stop: Callable[[], bool],
@@ -597,13 +670,14 @@ class BossAdapter:
             chat_task = self._pop_next_chat_task(pending_inbound_tasks, pending_apply_tasks, pending_task_keys)
             discovered_activity = False
             if chat_task is None:
-                discovered_activity = await self._discover_inbound_chat_tasks(
-                    chat_page,
-                    conversation_states,
-                    pending_inbound_tasks,
-                    pending_task_keys,
-                    should_stop,
-                )
+                if not boss_first_greeting_only:
+                    discovered_activity = await self._discover_inbound_chat_tasks(
+                        chat_page,
+                        conversation_states,
+                        pending_inbound_tasks,
+                        pending_task_keys,
+                        should_stop,
+                    )
                 chat_task = self._pop_next_chat_task(pending_inbound_tasks, pending_apply_tasks, pending_task_keys)
             handled_activity = False
             if chat_task is not None:
@@ -618,6 +692,7 @@ class BossAdapter:
                     enable_image_resume,
                     image_resume_path,
                     auto_agree_wechat_card,
+                    boss_first_greeting_only,
                     enable_follow_up_reply,
                     follow_up_reply_rules,
                     should_stop,
@@ -768,6 +843,7 @@ class BossAdapter:
         enable_image_resume: bool,
         image_resume_path: str,
         auto_agree_wechat_card: bool,
+        boss_first_greeting_only: bool,
         enable_follow_up_reply: bool,
         follow_up_reply_rules: list[dict],
         should_stop: Callable[[], bool],
@@ -786,6 +862,7 @@ class BossAdapter:
                 enable_image_resume,
                 image_resume_path,
                 auto_agree_wechat_card,
+                boss_first_greeting_only,
                 enable_follow_up_reply,
                 follow_up_reply_rules,
                 should_stop,
@@ -793,6 +870,8 @@ class BossAdapter:
                 chat_event_callback,
             )
         if chat_task.kind == "inbound_reply":
+            if boss_first_greeting_only:
+                return False
             return await self._handle_inbound_chat_task(
                 chat_page,
                 chat_task,
@@ -819,6 +898,7 @@ class BossAdapter:
         enable_image_resume: bool,
         image_resume_path: str,
         auto_agree_wechat_card: bool,
+        boss_first_greeting_only: bool,
         enable_follow_up_reply: bool,
         follow_up_reply_rules: list[dict],
         should_stop: Callable[[], bool],
@@ -927,7 +1007,12 @@ class BossAdapter:
                         status_callback(f"Boss 已发送图片: {image_resume_path}")
 
             normalized_message = self._normalize_text(latest_friend_message)
-            if enable_follow_up_reply and normalized_message and normalized_message not in state.replied_messages:
+            if (
+                not boss_first_greeting_only
+                and enable_follow_up_reply
+                and normalized_message
+                and normalized_message not in state.replied_messages
+            ):
                 reply_message = self._build_follow_up_reply(
                     latest_friend_message,
                     current_job_name,
@@ -1278,8 +1363,16 @@ class BossAdapter:
         )
         return jobs_page, chat_page
 
-    def _launch_external_chrome(self, chrome_path: str, profile_path: Path, debug_port: int, entry_url: str) -> int:
-        launch_options = build_browser_launch_options(False)
+    def _launch_external_chrome(
+        self,
+        chrome_path: str,
+        profile_path: Path,
+        debug_port: int,
+        entry_url: str,
+        *,
+        launch_options: dict | None = None,
+    ) -> int:
+        launch_options = launch_options or build_browser_launch_options(False)
         args = [
             f"--remote-debugging-port={debug_port}",
             f"--user-data-dir={profile_path}",
@@ -1307,10 +1400,16 @@ class BossAdapter:
         return int(pid_text)
 
     @staticmethod
-    def _wait_for_cdp_endpoint(debug_port: int, timeout: int = 20) -> str | None:
+    def _wait_for_cdp_endpoint(
+        debug_port: int,
+        timeout: int = 20,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> str | None:
         deadline = time.time() + timeout
         url = f"http://127.0.0.1:{debug_port}/json/version"
         while time.time() < deadline:
+            if should_stop and should_stop():
+                return None
             try:
                 with urllib.request.urlopen(url, timeout=2) as response:
                     payload = json.loads(response.read().decode("utf-8"))
@@ -1464,6 +1563,7 @@ class BossAdapter:
                   card.querySelector(".job-salary")?.textContent ||
                   card.querySelector("[class*=salary]")?.textContent
                 );
+                const tagItems = Array.from(card.querySelectorAll(".tag-list li")).map((item) => rawText(item.textContent)).filter(Boolean);
                 const platformJobId =
                   card.getAttribute("data-jobid") ||
                   card.dataset.jobid ||
@@ -1479,6 +1579,7 @@ class BossAdapter:
                   company,
                   href,
                   salary_text: salaryText,
+                  job_tags: tagItems,
                   platform_job_id: platformJobId,
                   is_headhunter: headhunterAlt.includes("猎头"),
                   include_matched: includeMatched,
@@ -1531,7 +1632,9 @@ class BossAdapter:
             await self._first_available_text(jobs_page, self.selectors.detail_salary_candidates)
             or str(card.get("salary_text", "") or "")
         )
-        experience_text = await self._first_available_text(jobs_page, self.selectors.detail_experience_candidates)
+        card_tags = card.get("job_tags") if isinstance(card.get("job_tags"), list) else []
+        detail_limit_text = await self._first_available_text(jobs_page, self.selectors.detail_experience_candidates)
+        experience_text, education_text = self._resolve_job_limits(detail_limit_text, card_tags)
         description = await self._extract_detail_description(jobs_page)
         tags = await self._extract_tags(jobs_page)
         recruiter_status = await self._extract_recruiter_status(jobs_page)
@@ -1552,8 +1655,34 @@ class BossAdapter:
             "tags": tags,
             "city": (card.get("city") or "").strip() or "未标注",
             "experience_text": experience_text or "不限",
+            "education_text": education_text or "未标注",
             "recruiter_status": recruiter_status,
         }
+
+    @staticmethod
+    def _resolve_job_limits(detail_limit_text: str, card_tags: list[str]) -> tuple[str, str]:
+        normalized_tags = [BossAdapter._normalize_text(str(item)) for item in card_tags if BossAdapter._normalize_text(str(item))]
+        experience_text = normalized_tags[0] if normalized_tags else ""
+        education_text = normalized_tags[1] if len(normalized_tags) > 1 else ""
+
+        normalized_detail = BossAdapter._normalize_text(detail_limit_text)
+        if normalized_detail:
+            detail_parts = [
+                part
+                for part in re.split(r"[ /|｜·]+", normalized_detail)
+                if BossAdapter._normalize_text(part)
+            ]
+            for part in detail_parts:
+                normalized_part = BossAdapter._normalize_text(part)
+                if not experience_text and re.search(r"经验|应届|年", normalized_part):
+                    experience_text = normalized_part
+                if (
+                    not education_text
+                    and re.search(r"学历|大专|专科|本科|硕士|博士|中专|高中|初中|不限", normalized_part)
+                ):
+                    education_text = normalized_part
+
+        return experience_text or "不限", education_text or "未标注"
 
     async def _start_chat_from_job(self, jobs_page) -> dict[str, str | bool]:
         await self._dismiss_greet_boss_dialog(jobs_page, max_rounds=4)
@@ -2399,6 +2528,7 @@ class BossAdapter:
             value = BossAdapter._parse_salary_part(salary)
             return value, value
         left, right = salary.split("-", maxsplit=1)
+        left, right = BossAdapter._inherit_range_units(left, right)
         return BossAdapter._parse_salary_part(left), BossAdapter._parse_salary_part(right)
 
     @staticmethod
@@ -2413,6 +2543,20 @@ class BossAdapter:
         if "k" in normalized:
             return number
         return number / 1000 if number > 1000 else number
+
+    @staticmethod
+    def _inherit_range_units(left: str, right: str) -> tuple[str, str]:
+        unit_pattern = re.compile(r"[wk]", re.IGNORECASE)
+        left_unit_match = unit_pattern.search(left)
+        right_unit_match = unit_pattern.search(right)
+        left_unit = left_unit_match.group(0).lower() if left_unit_match else ""
+        right_unit = right_unit_match.group(0).lower() if right_unit_match else ""
+
+        if not left_unit and right_unit:
+            left = f"{left}{right_unit}"
+        elif left_unit and not right_unit:
+            right = f"{right}{left_unit}"
+        return left, right
 
     @staticmethod
     def _build_hr_key(hr_name: str, company_name: str) -> str:
