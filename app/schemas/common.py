@@ -1,8 +1,11 @@
-from datetime import datetime
+from datetime import date, datetime
+import re
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.models.entities import DeliveryStatus, Platform, TaskStatus
+from app.core.time_utils import local_today
 
 
 def _default_boss_reply_rules() -> list[dict]:
@@ -183,6 +186,79 @@ class StatsOut(BaseModel):
     experience_buckets: list[StatsBucketOut]
     city_buckets: list[StatsBucketOut]
     keyword_buckets: list[StatsBucketOut]
+
+
+class AnalysisFieldFlagsIn(BaseModel):
+    title: bool = True
+    company_name: bool = True
+    salary_text: bool = True
+    city: bool = True
+    experience_text: bool = True
+    education_text: bool = True
+    tags: bool = True
+    description: bool = True
+    delivery_status: bool = True
+    send_status: bool = True
+    status_reason: bool = True
+    account_name: bool = True
+    discovered_at: bool = True
+    event_at: bool = True
+
+
+class AnalysisReportPackRequest(BaseModel):
+    platform: Platform
+    report_type: Literal["daily", "weekly", "strategy"] = "daily"
+    date_basis: Literal["delivery", "discovery"] = "delivery"
+    date_from: date = Field(default_factory=local_today)
+    date_to: date | None = None
+    compare_previous_period: bool = True
+    account_id: int | None = None
+    account_ids: list[int] = Field(default_factory=list)
+    account_ids_csv: str = ""
+    sample_limit: int = Field(default=5, ge=1, le=10)
+    max_description_chars: int = Field(default=240, ge=80, le=1200)
+    focus: str = ""
+    field_flags: AnalysisFieldFlagsIn = Field(default_factory=AnalysisFieldFlagsIn)
+
+    @model_validator(mode="after")
+    def normalize_request(self) -> "AnalysisReportPackRequest":
+        merged_ids: list[int] = []
+        if self.account_id is not None:
+            merged_ids.append(self.account_id)
+        merged_ids.extend(self.account_ids)
+        if self.account_ids_csv.strip():
+            for part in re.split(r"[\s,，]+", self.account_ids_csv.strip()):
+                if not part:
+                    continue
+                try:
+                    merged_ids.append(int(part))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid account id: {part}") from exc
+
+        self.account_ids = sorted({value for value in merged_ids if value > 0})
+        self.date_to = self.date_to or self.date_from
+        if self.date_to < self.date_from:
+            raise ValueError("date_to must be greater than or equal to date_from")
+        self.focus = self.focus.strip()
+        return self
+
+
+class AnalysisDataQualityFlagOut(BaseModel):
+    level: str
+    code: str
+    message: str
+    count: int | None = None
+
+
+class AnalysisReportPackOut(BaseModel):
+    meta: dict[str, Any] = Field(default_factory=dict)
+    field_flags: dict[str, bool] = Field(default_factory=dict)
+    stats: dict[str, Any] = Field(default_factory=dict)
+    comparison: dict[str, Any] = Field(default_factory=dict)
+    strategy_inputs: dict[str, Any] = Field(default_factory=dict)
+    samples: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    data_quality_flags: list[AnalysisDataQualityFlagOut] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class PreviewStateOut(BaseModel):

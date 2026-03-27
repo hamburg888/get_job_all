@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from app.core.config import settings
 from app.automation.browser_factory import (
@@ -119,6 +119,7 @@ class ZhilianAdapter:
         live_preview_interval_ms: int = 1000,
         delivery_interval_seconds: int = 3,
         max_deliveries_per_run: int = 100,
+        pagination_test_only: bool = False,
     ) -> None:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         from playwright.async_api import async_playwright
@@ -192,6 +193,8 @@ class ZhilianAdapter:
                     await self.wait_for_login(list_page, should_stop, status_callback, confirm_login_callback)
                     if should_stop():
                         return
+                if pagination_test_only and status_callback:
+                    status_callback("智联当前处于翻页测试模式：本次不会执行投递，只验证列表分页是否正常切换。")
                 for search_term in effective_search_terms:
                     search_label = search_term or "手动URL"
                     if should_stop():
@@ -219,70 +222,87 @@ class ZhilianAdapter:
                         if count == 0:
                             logger.warning("No job cards found on current page.")
                             if status_callback:
-                                status_callback(f"搜索词 {search_term} 当前页未找到岗位卡片，切换下一个搜索词。")
+                                status_callback(f" {search_term} 当前页未找到岗位卡片，切换下一个。")
                             break
-                        for index in range(count):
-                            if should_stop():
-                                break
+                        if pagination_test_only:
+                            active_page_number = await self._read_active_page_index(list_page) or 1
+                            first_title = await self._extract_list_card_title(cards.nth(0))
                             if status_callback:
-                                status_callback(f"搜索词 {search_label}：正在打开第 {index + 1} 个岗位详情")
-                            list_page = await self.ensure_list_page(context, list_page, target_entry_url)
-                            pages_before_detail = self._snapshot_open_pages(context)
-                            detail_page = await self.open_detail_page(context, list_page, cards.nth(index))
-                            preview_ref["page"] = detail_page
-                            stop_after_cleanup = False
-                            stop_due_to_daily_limit = False
-                            daily_limit_reason = ""
-                            job_payload = None
-                            detail_url = self._safe_page_url(detail_page)
-                            try:
-                                await detail_page.wait_for_load_state("domcontentloaded")
-                                if await self._sleep_or_stop(2.5, should_stop):
-                                    stop_after_cleanup = True
-                                    continue
-                                detail_url = detail_page.url
-                                job_payload = await self.extract_job_payload(detail_page, detail_url)
-                                job_payload["search_term"] = search_label
-                                job_payload["already_delivered"] = False
-                                delivery_result = await self.try_deliver(detail_page, context, should_stop)
-                                job_payload["already_delivered"] = bool(delivery_result.get("already_delivered", False))
-                                job_payload["delivery_success"] = bool(delivery_result.get("success", False)) and not job_payload["already_delivered"]
-                                job_payload["status_reason"] = str(delivery_result.get("reason", "未完成投递"))
-                                stop_due_to_daily_limit = bool(delivery_result.get("daily_limit_reached", False))
-                                daily_limit_reason = job_payload["status_reason"]
-                                if stop_due_to_daily_limit and status_callback:
-                                    status_callback("检测到智联今日投递已超过上限，结束本次任务")
-                            except (PlaywrightTimeoutError, TimeoutError):
-                                logger.info("Deliver button not clickable for %s", detail_url)
-                                if job_payload is not None:
-                                    job_payload["already_delivered"] = False
-                                    job_payload["delivery_success"] = False
-                                    job_payload["status_reason"] = "未找到可点击的立即投递按钮"
-                            finally:
-                                if job_payload is not None:
-                                    per_job_callback(job_payload)
-                                list_page = await self.close_delivery_pages(
-                                    context,
-                                    list_page,
-                                    detail_page,
-                                    pages_before_detail,
-                                    target_entry_url,
-                                    should_stop,
+                                title_suffix = f"，首个岗位：{first_title}" if first_title else ""
+                                status_callback(
+                                    f" {search_label}：翻页测试第 {active_page_number} 页，共 {count} 个岗位{title_suffix}"
                                 )
-                                with contextlib.suppress(Exception):
-                                    await list_page.bring_to_front()
-                                preview_ref["page"] = list_page
-                            if stop_due_to_daily_limit:
-                                raise ZhilianDailyLimitReached(daily_limit_reason or "检测到智联今日投递已超过上限，结束本次任务")
-                            if stop_after_cleanup:
-                                break
+                        else:
+                            for index in range(count):
+                                if should_stop():
+                                    break
+                                if status_callback:
+                                    status_callback(f" {search_label}：正在打开第 {index + 1} 个岗位详情")
+                                list_page = await self.ensure_list_page(context, list_page, target_entry_url)
+                                pages_before_detail = self._snapshot_open_pages(context)
+                                detail_page = await self.open_detail_page(context, list_page, cards.nth(index))
+                                preview_ref["page"] = detail_page
+                                stop_after_cleanup = False
+                                stop_due_to_daily_limit = False
+                                daily_limit_reason = ""
+                                job_payload = None
+                                detail_url = self._safe_page_url(detail_page)
+                                try:
+                                    await detail_page.wait_for_load_state("domcontentloaded")
+                                    if await self._sleep_or_stop(2.5, should_stop):
+                                        stop_after_cleanup = True
+                                        continue
+                                    detail_url = detail_page.url
+                                    job_payload = await self.extract_job_payload(detail_page, detail_url)
+                                    job_payload["search_term"] = search_label
+                                    job_payload["already_delivered"] = False
+                                    delivery_result = await self.try_deliver(detail_page, context, should_stop)
+                                    job_payload["already_delivered"] = bool(delivery_result.get("already_delivered", False))
+                                    job_payload["delivery_success"] = bool(delivery_result.get("success", False)) and not job_payload["already_delivered"]
+                                    job_payload["status_reason"] = str(delivery_result.get("reason", "未完成投递"))
+                                    stop_due_to_daily_limit = bool(delivery_result.get("daily_limit_reached", False))
+                                    daily_limit_reason = job_payload["status_reason"]
+                                    if stop_due_to_daily_limit and status_callback:
+                                        status_callback("检测到智联今日投递已超过上限，结束本次任务")
+                                except (PlaywrightTimeoutError, TimeoutError):
+                                    logger.info("Deliver button not clickable for %s", detail_url)
+                                    if job_payload is not None:
+                                        job_payload["already_delivered"] = False
+                                        job_payload["delivery_success"] = False
+                                        job_payload["status_reason"] = "未找到可点击的立即投递按钮"
+                                finally:
+                                    if job_payload is not None:
+                                        per_job_callback(job_payload)
+                                    list_page = await self.close_delivery_pages(
+                                        context,
+                                        list_page,
+                                        detail_page,
+                                        pages_before_detail,
+                                        target_entry_url,
+                                        should_stop,
+                                    )
+                                    with contextlib.suppress(Exception):
+                                        await list_page.bring_to_front()
+                                    preview_ref["page"] = list_page
+                                if stop_due_to_daily_limit:
+                                    raise ZhilianDailyLimitReached(
+                                        daily_limit_reason or "检测到智联今日投递已超过上限，结束本次任务"
+                                    )
+                                if stop_after_cleanup:
+                                    break
 
                         next_page = list_page.locator(self.selectors.next_page)
                         if await next_page.count() == 0:
+                            if pagination_test_only and status_callback:
+                                status_callback(f" {search_label}：翻页测试已到最后一页，结束本次测试")
                             break
                         if status_callback:
-                            status_callback(f"搜索词 {search_label} 当前页处理完成，准备进入下一页")
-                        await next_page.click()
+                            if pagination_test_only:
+                                current_page_number = await self._read_active_page_index(list_page) or 1
+                                status_callback(f" {search_label}：当前页检查完成，准备进入第 {current_page_number + 1} 页")
+                            else:
+                                status_callback(f" {search_label} 当前页处理完成，准备进入下一页")
+                        await self.go_to_next_page(list_page, should_stop, status_callback)
                         if await self._sleep_or_stop(4.0, should_stop):
                             break
             finally:
@@ -475,6 +495,241 @@ class ZhilianAdapter:
         async with context.expect_page() as page_info:
             await card_locator.click()
         return await page_info.value
+
+    async def go_to_next_page(
+        self,
+        list_page,
+        should_stop: Callable[[], bool],
+        status_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        next_page = list_page.locator(self.selectors.next_page).first
+        if await next_page.count() == 0:
+            raise RuntimeError("智联当前页不存在“下一页”按钮，无法继续翻页")
+
+        current_url = self._safe_page_url(list_page)
+        current_page_index = await self._read_active_page_index(list_page)
+        previous_signature = await self._read_page_signature(list_page)
+        href = ""
+        with contextlib.suppress(Exception):
+            href = (await next_page.get_attribute("href") or "").strip()
+        target_url = urljoin(current_url, href) if href else ""
+        expected_page_index = self._extract_page_index_from_url(target_url)
+        if expected_page_index is None and current_page_index is not None:
+            expected_page_index = current_page_index + 1
+
+        click_errors: list[str] = []
+
+        if target_url:
+            try:
+                await list_page.goto(target_url, wait_until="networkidle")
+                if await self._wait_for_page_turn(
+                    list_page,
+                    should_stop,
+                    previous_url=current_url,
+                    previous_page_index=current_page_index,
+                    previous_signature=previous_signature,
+                    expected_page_index=expected_page_index,
+                    expected_url=target_url,
+                ):
+                    if status_callback:
+                        status_callback("智联翻页已切换为链接直跳模式")
+                    return
+                with contextlib.suppress(Exception):
+                    await list_page.reload(wait_until="networkidle")
+                if await self._wait_for_page_turn(
+                    list_page,
+                    should_stop,
+                    previous_url=current_url,
+                    previous_page_index=current_page_index,
+                    previous_signature=previous_signature,
+                    expected_page_index=expected_page_index,
+                    expected_url=target_url,
+                ):
+                    if status_callback:
+                        status_callback("智联翻页已切换为链接直跳模式")
+                    return
+                click_errors.append("直跳 href 后岗位列表未发生变化")
+            except Exception as exc:  # noqa: BLE001
+                click_errors.append(f"直跳 href 失败: {exc}")
+                logger.warning(
+                    "Zhilian next page href primary navigation failed: current=%s target=%s",
+                    current_url,
+                    target_url,
+                    exc_info=True,
+                )
+
+        try:
+            await self._prepare_next_page_click(list_page, next_page, should_stop)
+            await next_page.click(timeout=3000)
+            if await self._wait_for_page_turn(
+                list_page,
+                should_stop,
+                previous_url=current_url,
+                previous_page_index=current_page_index,
+                previous_signature=previous_signature,
+                expected_page_index=expected_page_index,
+                expected_url=target_url,
+            ):
+                return
+            click_errors.append("普通点击未触发真实翻页")
+        except Exception as exc:  # noqa: BLE001
+            click_errors.append(f"普通点击失败: {exc}")
+            logger.warning("Zhilian next page normal click failed: url=%s", current_url, exc_info=True)
+
+        try:
+            await self._prepare_next_page_click(list_page, next_page, should_stop)
+            await next_page.evaluate("(el) => el.click()")
+            if await self._wait_for_page_turn(
+                list_page,
+                should_stop,
+                previous_url=current_url,
+                previous_page_index=current_page_index,
+                previous_signature=previous_signature,
+                expected_page_index=expected_page_index,
+                expected_url=target_url,
+            ):
+                if status_callback:
+                    status_callback("智联翻页已切换为脚本点击模式")
+                return
+            click_errors.append("脚本点击未触发真实翻页")
+        except Exception as exc:  # noqa: BLE001
+            click_errors.append(f"脚本点击失败: {exc}")
+            logger.warning("Zhilian next page script click failed: url=%s", current_url, exc_info=True)
+
+        raise RuntimeError("智联翻页失败：" + " | ".join(click_errors))
+
+    async def _wait_for_page_turn(
+        self,
+        list_page,
+        should_stop: Callable[[], bool],
+        *,
+        previous_url: str,
+        previous_page_index: int | None,
+        previous_signature: str,
+        expected_page_index: int | None,
+        expected_url: str = "",
+        timeout_ms: int = 10000,
+    ) -> bool:
+        deadline = time.time() + timeout_ms / 1000
+        expected_url = expected_url.rstrip("/")
+        previous_url = previous_url.rstrip("/")
+
+        while time.time() < deadline:
+            if should_stop():
+                return False
+
+            current_url = self._safe_page_url(list_page).rstrip("/")
+            current_page_index = await self._read_active_page_index(list_page)
+            current_signature = await self._read_page_signature(list_page)
+            signature_changed = bool(current_signature and current_signature != previous_signature)
+
+            if expected_url and current_url == expected_url and signature_changed:
+                return True
+            if (
+                expected_page_index is not None
+                and current_page_index == expected_page_index
+                and signature_changed
+            ):
+                return True
+            if (
+                previous_page_index is not None
+                and current_page_index is not None
+                and current_page_index != previous_page_index
+                and signature_changed
+            ):
+                return True
+            if current_url and previous_url and current_url != previous_url and signature_changed:
+                return True
+
+            await self._sleep_or_stop(0.25, should_stop)
+
+        return False
+
+    async def _prepare_next_page_click(self, list_page, next_page, should_stop: Callable[[], bool]) -> None:
+        await list_page.evaluate(
+            """() => {
+                const doc = document.documentElement || document.body;
+                const height = Math.max(
+                  doc?.scrollHeight || 0,
+                  document.body?.scrollHeight || 0,
+                  document.documentElement?.scrollHeight || 0
+                );
+                window.scrollTo({ top: height, behavior: 'instant' });
+            }"""
+        )
+        if await self._sleep_or_stop(0.2, should_stop):
+            return
+
+        await next_page.evaluate(
+            """(el) => {
+                const stickyBottom = Array.from(document.querySelectorAll('body *'))
+                  .filter((node) => {
+                    const style = window.getComputedStyle(node);
+                    if (!style) return false;
+                    const rect = node.getBoundingClientRect();
+                    return (
+                      (style.position === 'fixed' || style.position === 'sticky') &&
+                      rect.height > 0 &&
+                      rect.width > 0 &&
+                      rect.top <= 0 &&
+                      rect.bottom > 0
+                    );
+                  })
+                  .reduce((max, node) => Math.max(max, node.getBoundingClientRect().bottom), 0);
+                const rect = el.getBoundingClientRect();
+                const absoluteTop = window.scrollY + rect.top;
+                const targetTop = Math.max(0, absoluteTop - stickyBottom - 32);
+                window.scrollTo({ top: targetTop, behavior: 'instant' });
+            }"""
+        )
+        await self._sleep_or_stop(0.2, should_stop)
+
+    async def _extract_list_card_title(self, card_locator) -> str:
+        with contextlib.suppress(Exception):
+            title = await card_locator.evaluate(
+                """(el) => {
+                    const anchor =
+                      el.querySelector('a[href*="/jobdetail/"]') ||
+                      el.querySelector('a[href*="jobdetail"]') ||
+                      el.querySelector('a');
+                    return (anchor?.textContent || '').replace(/\\s+/g, ' ').trim();
+                }"""
+            )
+            return self._normalize_text(title)
+        return ""
+
+    async def _read_page_signature(self, list_page, sample_size: int = 3) -> str:
+        cards = list_page.locator(self.selectors.job_card)
+        with contextlib.suppress(Exception):
+            count = min(await cards.count(), sample_size)
+            parts: list[str] = []
+            for index in range(count):
+                card = cards.nth(index)
+                href = await self._extract_detail_href(card)
+                title = await self._extract_list_card_title(card)
+                parts.append(f"{href}|{title}")
+            return " || ".join(parts)
+        return ""
+
+    async def _read_active_page_index(self, list_page) -> int | None:
+        locator = list_page.locator(".soupager__index--active").first
+        with contextlib.suppress(Exception):
+            if await locator.count():
+                text = (await locator.inner_text()).strip()
+                if text.isdigit():
+                    return int(text)
+        return None
+
+    @staticmethod
+    def _extract_page_index_from_url(url: str) -> int | None:
+        if not url:
+            return None
+        match = re.search(r"/p(\d+)(?:[/?#]|$)", url)
+        if match:
+            return int(match.group(1))
+        if "/sou/" in url:
+            return 1
+        return None
 
     async def ensure_list_page(self, context, current_page, target_entry_url: str):
         if current_page is not None and not current_page.is_closed():

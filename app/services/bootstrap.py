@@ -36,6 +36,14 @@ def bootstrap_demo_data() -> None:
                     profile_dir="browser_profiles/boss/account_2",
                     is_default=True,
                 ),
+                Account(
+                    platform=Platform.QIANCHENG.value,
+                    phone="13700000001",
+                    username="前程账号A",
+                    remark="默认前程无忧账号",
+                    profile_dir="browser_profiles/qiancheng/account_3",
+                    is_default=True,
+                ),
             ]
             db.add_all(accounts)
             db.commit()
@@ -46,6 +54,7 @@ def bootstrap_demo_data() -> None:
 
         rules = [
             RuleConfig(platform=Platform.ZHILIAN.value, keyword="全栈开发", city="广州", auto_send_chat=False),
+            RuleConfig(platform=Platform.QIANCHENG.value, keyword="Java后端", city="深圳", auto_send_chat=False),
             RuleConfig(platform=Platform.BOSS.value, keyword="Python后端", city="深圳", auto_send_chat=True),
         ]
         db.add_all(rules)

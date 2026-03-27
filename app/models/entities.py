@@ -10,6 +10,7 @@ from app.db.database import Base
 
 class Platform(StrEnum):
     BOSS = "boss"
+    QIANCHENG = "qiancheng"
     ZHILIAN = "zhilian"
 
 

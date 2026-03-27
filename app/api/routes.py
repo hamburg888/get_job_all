@@ -14,6 +14,8 @@ from app.schemas.common import (
     AccountOut,
     AccountSetDefaultRequest,
     AccountUpdate,
+    AnalysisReportPackOut,
+    AnalysisReportPackRequest,
     BrowserConfigSessionOut,
     ConfirmLoginRequest,
     DeliveryOut,
@@ -32,6 +34,7 @@ from app.schemas.common import (
 )
 from app.services.account_browser_service import account_browser_service
 from app.services.account_service import create_account, get_account, list_accounts, set_default_account, update_account
+from app.services.analysis_service import build_analysis_report_pack
 from app.services.dashboard_service import DashboardFilters, get_overview, get_stats, list_deliveries, list_jobs, list_logs
 from app.services.live_preview_service import live_preview_service
 from app.services.task_runner import task_runner
@@ -169,6 +172,11 @@ def dashboard_stats(
     db: Session = Depends(get_db),
 ) -> dict:
     return get_stats(db, platform, filters)
+
+
+@router.post("/analysis/report-pack", response_model=AnalysisReportPackOut)
+def analysis_report_pack(payload: AnalysisReportPackRequest, db: Session = Depends(get_db)) -> dict:
+    return build_analysis_report_pack(db, payload)
 
 
 @router.get("/tasks/status/{platform}", response_model=TaskStatusResponse)

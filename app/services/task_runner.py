@@ -10,6 +10,7 @@ import sys
 from sqlalchemy import desc, select
 
 from app.automation.adapters.boss_adapter import BossAdapter
+from app.automation.adapters.qiancheng_adapter import QianchengAdapter
 from app.automation.adapters.zhilian_adapter import ZhilianAdapter, ZhilianDailyLimitReached
 from app.core.config import settings
 from app.core.time_utils import local_now
@@ -46,6 +47,16 @@ class TaskRunner:
     def __init__(self) -> None:
         self._workers: dict[str, WorkerState] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _task_keyword(payload: StartTaskRequest) -> str:
+        if payload.use_manual_entry_url:
+            return payload.manual_entry_url
+        if payload.search_terms:
+            return ",".join(payload.search_terms)
+        if payload.platform == Platform.QIANCHENG:
+            return "默认搜索页"
+        return ""
 
     def start(self, payload: StartTaskRequest) -> TaskStatusResponse:
         platform_key = payload.platform.value
@@ -89,7 +100,7 @@ class TaskRunner:
                 task = TaskRun(
                     account_id=account.id if account else None,
                     platform=platform_key,
-                    keyword=payload.manual_entry_url if payload.use_manual_entry_url else ",".join(payload.search_terms),
+                    keyword=self._task_keyword(payload),
                     status=TaskStatus.RUNNING.value,
                     current_step="正在准备浏览器与筛选条件",
                     current_step_started_at=local_now(),
@@ -118,7 +129,8 @@ class TaskRunner:
                             f"headless_enabled={payload.headless_enabled}, "
                             f"live_preview_enabled={payload.live_preview_enabled}, "
                             f"use_manual_entry_url={payload.use_manual_entry_url}, "
-                            f"entry_url={payload.manual_entry_url or '-'}"
+                            f"entry_url={payload.manual_entry_url or '-'}, "
+                            f"search_terms={','.join(payload.search_terms) or '-'}"
                         ),
                         extra_json={
                             "account_id": payload.account_id,
@@ -126,6 +138,7 @@ class TaskRunner:
                             "live_preview_enabled": payload.live_preview_enabled,
                             "use_manual_entry_url": payload.use_manual_entry_url,
                             "manual_entry_url": payload.manual_entry_url,
+                            "search_terms": payload.search_terms,
                         },
                     )
                 )
@@ -271,6 +284,8 @@ class TaskRunner:
             self._log(payload.platform, task_run_id, "task_prepare", "已加载站点规则与任务参数")
             if payload.platform == Platform.ZHILIAN:
                 self._run_zhilian(task_run_id, payload, stop_event)
+            elif payload.platform == Platform.QIANCHENG:
+                self._run_qiancheng(task_run_id, payload, stop_event)
             else:
                 self._run_boss(task_run_id, payload, stop_event)
             final_status = TaskStatus.STOPPED if stop_event.is_set() else TaskStatus.COMPLETED
@@ -426,7 +441,7 @@ class TaskRunner:
                         task_run_id=task.id,
                         event_type="job_processed",
                         message=(
-                            f"搜索词 {job_payload.get('search_term', '')} | "
+                            f" {job_payload.get('search_term', '')} | "
                             f"{job.title} / {job.company_name} / {delivery.status} / {status_reason}"
                         ),
                         extra_json={
@@ -487,6 +502,201 @@ class TaskRunner:
                 )
         else:
             self._set_status(task_run_id, TaskStatus.RUNNING, "模拟执行智联搜索与投递流程")
+            adapter.run_sync_mock(",".join(payload.search_terms), process_job, stop_event.is_set)
+
+    def _run_qiancheng(self, task_run_id: int, payload: StartTaskRequest, stop_event: threading.Event) -> None:
+        adapter = QianchengAdapter()
+        with self._lock:
+            worker = self._workers.get(payload.platform.value)
+            if worker and worker.task_run_id == task_run_id:
+                worker.force_stop = adapter.request_stop
+        with SessionLocal() as db:
+            account = self._resolve_account(db, payload)
+
+        def update_step(message: str) -> None:
+            with SessionLocal() as db:
+                task = db.get(TaskRun, task_run_id)
+                if not task:
+                    return
+                self._assign_current_step(task, message)
+                db.add(
+                    TaskLog(
+                        platform=payload.platform.value,
+                        task_run_id=task.id,
+                        event_type="task_progress",
+                        message=message,
+                    )
+                )
+                db.commit()
+            live_preview_service.update_status(
+                payload.platform,
+                task_run_id=task_run_id,
+                current_step=message,
+                message=message,
+            )
+
+        def wait_for_login_confirmation() -> bool:
+            while not stop_event.is_set():
+                worker_state = self._workers.get(payload.platform.value)
+                if worker_state and worker_state.login_confirm_event.is_set():
+                    worker_state.login_confirm_event.clear()
+                    return True
+                time.sleep(0.5)
+            return False
+
+        def process_job(job_payload: dict) -> None:
+            if stop_event.is_set():
+                return
+            with SessionLocal() as db:
+                task = db.get(TaskRun, task_run_id)
+                if not task:
+                    return
+                self._assign_current_step(task, f"处理中: {job_payload['title']}")
+                task.processed_count += 1
+
+                filter_result = self._match_filters(job_payload, payload)
+                already_delivered = bool(job_payload.get("already_delivered", False))
+                delivery_status = (
+                    DeliveryStatus.SKIPPED.value
+                    if not filter_result["matched"] or already_delivered
+                    else DeliveryStatus.DELIVERED.value
+                    if job_payload.get("delivery_success", True)
+                    else DeliveryStatus.FAILED.value
+                )
+                status_reason = (
+                    filter_result["reason"] if not filter_result["matched"] else job_payload.get("status_reason", "职位已投递")
+                )
+
+                existing_job = db.scalar(
+                    select(Job).where(
+                        Job.platform == payload.platform.value,
+                        Job.platform_job_id == job_payload["platform_job_id"],
+                    )
+                )
+                if existing_job:
+                    existing_job.title = job_payload["title"]
+                    existing_job.company_name = job_payload["company_name"]
+                    existing_job.salary_text = job_payload["salary_text"]
+                    existing_job.salary_min = job_payload.get("salary_min")
+                    existing_job.salary_max = job_payload.get("salary_max")
+                    existing_job.city = job_payload.get("city", payload.cities[0] if payload.cities else "")
+                    existing_job.experience_text = job_payload.get("experience_text", "不限")
+                    existing_job.education_text = job_payload.get("education_text", "未标注")
+                    existing_job.description = job_payload["description"]
+                    existing_job.detail_url = job_payload["detail_url"]
+                    existing_job.tags = job_payload.get("tags", [])
+                    existing_job.latest_status = delivery_status
+                    existing_job.task_run_id = task.id
+                    job = existing_job
+                else:
+                    job = Job(
+                        platform=payload.platform.value,
+                        platform_job_id=job_payload["platform_job_id"],
+                        title=job_payload["title"],
+                        company_name=job_payload["company_name"],
+                        salary_text=job_payload["salary_text"],
+                        salary_min=job_payload.get("salary_min"),
+                        salary_max=job_payload.get("salary_max"),
+                        city=job_payload.get("city", payload.cities[0] if payload.cities else ""),
+                        experience_text=job_payload.get("experience_text", "不限"),
+                        education_text=job_payload.get("education_text", "未标注"),
+                        description=job_payload["description"],
+                        detail_url=job_payload["detail_url"],
+                        tags=job_payload.get("tags", []),
+                        latest_status=delivery_status,
+                        task_run_id=task.id,
+                    )
+                    db.add(job)
+                    db.flush()
+
+                delivery = DeliveryRecord(
+                    job_id=job.id,
+                    task_run_id=task.id,
+                    account_id=task.account_id,
+                    platform=payload.platform.value,
+                    status=delivery_status,
+                    status_reason=status_reason,
+                    send_status=ChatSendStatus.SKIPPED.value,
+                    chat_hr_name="",
+                    chat_sent=False,
+                    chat_message="",
+                )
+                db.add(delivery)
+                if not filter_result["matched"]:
+                    task.failed_count += 1
+                elif already_delivered:
+                    pass
+                elif job_payload.get("delivery_success", True):
+                    task.delivered_count += 1
+                else:
+                    task.failed_count += 1
+                db.add(
+                    TaskLog(
+                        platform=payload.platform.value,
+                        task_run_id=task.id,
+                        event_type="job_processed",
+                        message=(
+                            f" {job_payload.get('search_term', '')} | "
+                            f"{job.title} / {job.company_name} / {delivery.status} / {status_reason}"
+                        ),
+                        extra_json={
+                            "detail_url": job.detail_url,
+                            "platform_job_id": job.platform_job_id,
+                            "search_term": job_payload.get("search_term"),
+                            "reason": status_reason,
+                        },
+                    )
+                )
+                db.commit()
+            time.sleep(1)
+
+        if settings.automation_mode == "playwright":
+            import asyncio
+
+            if sys.platform == "win32":
+                loop = asyncio.ProactorEventLoop()
+                try:
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(
+                        adapter.run_search_flow(
+                            payload.search_terms,
+                            account.profile_dir,
+                            process_job,
+                            stop_event.is_set,
+                            update_step,
+                            wait_for_login_confirmation,
+                            entry_url=payload.manual_entry_url if payload.use_manual_entry_url else None,
+                            task_run_id=task_run_id,
+                            headless=payload.headless_enabled,
+                            live_preview_enabled=payload.live_preview_enabled,
+                            live_preview_interval_ms=payload.live_preview_interval_ms,
+                            delivery_interval_seconds=payload.delivery_interval_seconds,
+                            max_deliveries_per_run=payload.max_deliveries_per_run,
+                        )
+                    )
+                finally:
+                    loop.close()
+                    asyncio.set_event_loop(None)
+            else:
+                asyncio.run(
+                    adapter.run_search_flow(
+                        payload.search_terms,
+                        account.profile_dir,
+                        process_job,
+                        stop_event.is_set,
+                        update_step,
+                        wait_for_login_confirmation,
+                        entry_url=payload.manual_entry_url if payload.use_manual_entry_url else None,
+                        task_run_id=task_run_id,
+                        headless=payload.headless_enabled,
+                        live_preview_enabled=payload.live_preview_enabled,
+                        live_preview_interval_ms=payload.live_preview_interval_ms,
+                        delivery_interval_seconds=payload.delivery_interval_seconds,
+                        max_deliveries_per_run=payload.max_deliveries_per_run,
+                    )
+                )
+        else:
+            self._set_status(task_run_id, TaskStatus.RUNNING, "模拟执行前程无忧搜索与投递流程")
             adapter.run_sync_mock(",".join(payload.search_terms), process_job, stop_event.is_set)
 
     def _run_boss(self, task_run_id: int, payload: StartTaskRequest, stop_event: threading.Event) -> None:
@@ -617,7 +827,7 @@ class TaskRunner:
                         task_run_id=task.id,
                         event_type="job_processed",
                         message=(
-                            f"搜索词 {job_payload.get('search_term', '')} | "
+                            f" {job_payload.get('search_term', '')} | "
                             f"{job.title} / {job.company_name} / {delivery.status} / {status_reason}"
                         ),
                         extra_json={
@@ -851,7 +1061,7 @@ class TaskRunner:
 
         if job_min is None and job_max is None and raw_salary_text:
             try:
-                job_min, job_max = BossAdapter.normalize_salary(raw_salary_text)
+                job_min, job_max = self._normalize_salary_by_platform(payload.platform, raw_salary_text)
             except Exception:  # noqa: BLE001
                 logger.warning("Salary normalize failed during filter matching: salary_text=%s", raw_salary_text, exc_info=True)
 
@@ -890,6 +1100,14 @@ class TaskRunner:
         if is_daily_salary:
             return f"{value:g}元/天"
         return f"{value:g}K"
+
+    @staticmethod
+    def _normalize_salary_by_platform(platform: Platform, raw_salary_text: str) -> tuple[float | None, float | None]:
+        if platform == Platform.ZHILIAN:
+            return ZhilianAdapter.normalize_salary(raw_salary_text)
+        if platform == Platform.QIANCHENG:
+            return QianchengAdapter.normalize_salary(raw_salary_text)
+        return BossAdapter.normalize_salary(raw_salary_text)
 
     def _normalize_boss_activity_status(self, raw_status: str) -> str:
         status = (raw_status or "").strip()

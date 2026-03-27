@@ -16,12 +16,13 @@ Path(settings.preview_frame_root).mkdir(parents=True, exist_ok=True)
 Path(settings.upload_root).mkdir(parents=True, exist_ok=True)
 Base.metadata.create_all(bind=engine)
 run_migrations()
-bootstrap_demo_data()
+if settings.bootstrap_demo_data_enabled:
+    bootstrap_demo_data()
 
 app = FastAPI(
     title="Job Help API",
     version="0.1.0",
-    description="Automation control plane for Zhilian and Boss job delivery tasks.",
+    description="Automation control plane for Zhilian, Qiancheng, and Boss job delivery tasks.",
 )
 
 app.add_middleware(

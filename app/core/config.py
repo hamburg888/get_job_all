@@ -6,10 +6,13 @@ class Settings(BaseSettings):
 
     app_name: str = "Job Help API"
     database_url: str = "sqlite:///./job_help.db"
+    bootstrap_demo_data_enabled: bool = False
     automation_mode: str = "playwright"
     cors_origins: list[str] = ["http://127.0.0.1:5173", "http://localhost:5173"]
     log_level: str = "INFO"
     zhilian_entry_url: str = "https://www.zhaopin.com/sou/jl763/p1"
+    qiancheng_entry_url: str = "https://we.51job.com/pc/search"
+    qiancheng_login_url: str = "https://login.51job.com/login.php"
     boss_entry_url: str = "https://www.zhipin.com/"
     boss_jobs_url: str = "https://www.zhipin.com/web/geek/jobs"
     boss_chat_url: str = "https://www.zhipin.com/web/geek/chat"

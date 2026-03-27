@@ -1,0 +1,355 @@
+app:
+  description: 复杂版求职投递分析工作流，输出日报和策略建议
+  icon: compass
+  icon_background: '#D9F2E6'
+  mode: workflow
+  name: 求职投递日报与策略建议
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.1.5
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions: []
+      allowed_file_types: []
+      allowed_file_upload_methods: []
+      enabled: false
+      fileUploadConfig:
+        audio_file_size_limit: 50
+        batch_count_limit: 5
+        file_size_limit: 15
+        image_file_size_limit: 10
+        video_file_size_limit: 100
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods: []
+      number_limits: 3
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        isInIteration: false
+        sourceType: start
+        targetType: http-request
+      id: edge-start-fetch
+      source: start_node
+      sourceHandle: source
+      target: fetch_report_pack
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: http-request
+        targetType: llm
+      id: edge-fetch-daily
+      source: fetch_report_pack
+      sourceHandle: source
+      target: generate_daily_report
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: llm
+      id: edge-daily-strategy
+      source: generate_daily_report
+      sourceHandle: source
+      target: generate_strategy_memo
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: end
+      id: edge-strategy-end
+      source: generate_strategy_memo
+      sourceHandle: source
+      target: end_node
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        desc: 复杂版输入，支持平台、口径、日期、账号和关注目标
+        selected: false
+        title: 开始
+        type: start
+        variables:
+        - default: zhilian
+          label: platform
+          max_length: 48
+          options:
+          - boss
+          - zhilian
+          required: true
+          type: select
+          variable: platform
+        - default: delivery
+          label: date_basis
+          max_length: 48
+          options:
+          - delivery
+          - discovery
+          required: true
+          type: select
+          variable: date_basis
+        - default: '2026-03-25'
+          label: date_from
+          max_length: 48
+          required: true
+          type: text-input
+          variable: date_from
+        - default: '2026-03-25'
+          label: date_to
+          max_length: 48
+          required: true
+          type: text-input
+          variable: date_to
+        - default: '3'
+          label: account_ids_csv
+          max_length: 128
+          required: false
+          type: text-input
+          variable: account_ids_csv
+        - default: 请重点识别高价值方向、失败原因、收缩方向和明日动作
+          label: focus
+          required: false
+          type: paragraph
+          variable: focus
+      height: 246
+      id: start_node
+      position:
+        x: 80
+        y: 240
+      positionAbsolute:
+        x: 80
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        authorization:
+          config: null
+          type: no-auth
+        body:
+          data: |
+            {
+              "platform": "{{#start_node.platform#}}",
+              "report_type": "strategy",
+              "date_basis": "{{#start_node.date_basis#}}",
+              "date_from": "{{#start_node.date_from#}}",
+              "date_to": "{{#start_node.date_to#}}",
+              "compare_previous_period": true,
+              "account_ids_csv": "{{#start_node.account_ids_csv#}}",
+              "sample_limit": 5,
+              "max_description_chars": 240,
+              "focus": "{{#start_node.focus#}}"
+            }
+          type: json
+        desc: 拉取复杂版 report-pack，包含 stats、comparison、strategy_inputs 和数据质量标记
+        headers: |
+          Content-Type: application/json
+        method: post
+        params: ''
+        selected: false
+        ssl_verify: false
+        timeout:
+          max_connect_timeout: 0
+          max_read_timeout: 0
+          max_write_timeout: 0
+        title: 获取复杂分析数据包
+        type: http-request
+        url: http://host.docker.internal:8000/api/analysis/report-pack
+      height: 170
+      id: fetch_report_pack
+      position:
+        x: 392
+        y: 240
+      positionAbsolute:
+        x: 392
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: 第一阶段，生成结构化日报
+        memory:
+          query_prompt_template: ''
+          role_prefix:
+            assistant: ''
+            user: ''
+          window:
+            enabled: false
+            size: 10
+        model:
+          completion_params:
+            temperature: 0.2
+          mode: chat
+          name: gpt-4o-mini
+          provider: openai
+        prompt_template:
+        - role: system
+          text: |
+            你是“求职投递数据分析师”。
+
+            你只能基于输入数据包分析，不允许编造任何未提供的信息。
+            先写事实，再写推断。
+            如果样本不足、上一周期为空、薪资口径混用、薪资异常等标记存在，必须明确提示。
+            输出必须是 Markdown。
+
+            固定结构：
+
+            # 今日概览
+            # 核心发现
+            ## 事实
+            ## 推断
+            # 岗位市场特征
+            # 技能标签趋势
+            # 投递效果分析
+            # 高价值机会
+            # 风险与问题
+
+            用户关注重点：
+            {{#start_node.focus#}}
+
+            分析数据包：
+            {{#fetch_report_pack.body#}}
+        selected: false
+        title: 生成日报
+        type: llm
+        vision:
+          enabled: false
+      height: 104
+      id: generate_daily_report
+      position:
+        x: 704
+        y: 180
+      positionAbsolute:
+        x: 704
+        y: 180
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: 第二阶段，基于数据包和日报输出策略建议
+        memory:
+          query_prompt_template: ''
+          role_prefix:
+            assistant: ''
+            user: ''
+          window:
+            enabled: false
+            size: 10
+        model:
+          completion_params:
+            temperature: 0.2
+          mode: chat
+          name: gpt-4o-mini
+          provider: openai
+        prompt_template:
+        - role: system
+          text: |
+            你是“求职投递策略顾问”。
+
+            你的任务不是重复日报，而是把日报和结构化数据包转成可执行策略。
+            你只能基于给定数据工作，不允许编造。
+            如果数据质量标记提示风险，你必须在策略里显式加入“冗错与校验”部分。
+            建议必须可执行、可筛选、可用于明天投递。
+
+            输出必须是 Markdown，固定结构：
+
+            # 策略总览
+            # 应扩大方向
+            # 应收缩方向
+            # 账号与口径建议
+            # 冗错与校验
+            # 明日行动清单
+
+            明日行动清单必须使用 1. 2. 3. 4. 5. 编号。
+
+            日报内容：
+            {{#generate_daily_report.text#}}
+
+            结构化数据包：
+            {{#fetch_report_pack.body#}}
+        selected: false
+        title: 生成策略建议
+        type: llm
+        vision:
+          enabled: false
+      height: 104
+      id: generate_strategy_memo
+      position:
+        x: 1016
+        y: 300
+      positionAbsolute:
+        x: 1016
+        y: 300
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 同时输出日报、策略建议和原始数据包
+        outputs:
+        - value_selector:
+          - generate_daily_report
+          - text
+          variable: daily_report_markdown
+        - value_selector:
+          - generate_strategy_memo
+          - text
+          variable: strategy_memo_markdown
+        - value_selector:
+          - fetch_report_pack
+          - body
+          variable: report_pack_json
+        selected: false
+        title: 结束
+        type: end
+      height: 140
+      id: end_node
+      position:
+        x: 1328
+        y: 240
+      positionAbsolute:
+        x: 1328
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244

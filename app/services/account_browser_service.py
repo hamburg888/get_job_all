@@ -114,7 +114,7 @@ class AccountBrowserService:
             profile_path.mkdir(parents=True, exist_ok=True)
 
             chrome_path = self._resolve_chrome_executable()
-            debug_port = self._pick_free_port() if platform == Platform.ZHILIAN else None
+            debug_port = self._pick_free_port() if platform != Platform.BOSS else None
             chrome_pid = self._launch_external_chrome(chrome_path, profile_path, debug_port, entry_url)
 
             if state:
@@ -475,6 +475,8 @@ class AccountBrowserService:
     def _platform_entry_url(platform: Platform) -> str:
         if platform == Platform.ZHILIAN:
             return settings.zhilian_entry_url
+        if platform == Platform.QIANCHENG:
+            return settings.qiancheng_login_url
         return settings.boss_login_url
 
     @staticmethod

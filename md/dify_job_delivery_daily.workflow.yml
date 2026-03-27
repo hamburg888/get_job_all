@@ -1,0 +1,281 @@
+app:
+  description: 基于 Job Help API 的投递日报分析工作流
+  icon: chart_with_upwards_trend
+  icon_background: '#FFEAD5'
+  mode: workflow
+  name: 求职投递日报分析
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.1.5
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions: []
+      allowed_file_types: []
+      allowed_file_upload_methods: []
+      enabled: false
+      fileUploadConfig:
+        audio_file_size_limit: 50
+        batch_count_limit: 5
+        file_size_limit: 15
+        image_file_size_limit: 10
+        video_file_size_limit: 100
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods: []
+      number_limits: 3
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        isInIteration: false
+        sourceType: start
+        targetType: http-request
+      id: edge-start-to-fetch
+      source: start_node
+      sourceHandle: source
+      target: fetch_report_pack
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: http-request
+        targetType: llm
+      id: edge-fetch-to-llm
+      source: fetch_report_pack
+      sourceHandle: source
+      target: generate_report
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: end
+      id: edge-llm-to-end
+      source: generate_report
+      sourceHandle: source
+      target: end_node
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        desc: 选择平台、账号、日期范围并触发日报分析
+        selected: false
+        title: 开始
+        type: start
+        variables:
+        - default: zhilian
+          label: platform
+          max_length: 48
+          options:
+          - boss
+          - zhilian
+          required: true
+          type: select
+          variable: platform
+        - default: delivery
+          label: date_basis
+          max_length: 48
+          options:
+          - delivery
+          - discovery
+          required: true
+          type: select
+          variable: date_basis
+        - default: '2026-03-25'
+          label: date_from
+          max_length: 48
+          required: true
+          type: text-input
+          variable: date_from
+        - default: '2026-03-25'
+          label: date_to
+          max_length: 48
+          required: true
+          type: text-input
+          variable: date_to
+        - default: '3'
+          label: account_ids_csv
+          max_length: 128
+          required: false
+          type: text-input
+          variable: account_ids_csv
+        - default: 请重点关注高价值方向、失败原因和明日建议
+          label: focus
+          required: false
+          type: paragraph
+          variable: focus
+      height: 246
+      id: start_node
+      position:
+        x: 80
+        y: 282
+      positionAbsolute:
+        x: 80
+        y: 282
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        authorization:
+          config: null
+          type: no-auth
+        body:
+          data: |
+            {
+              "platform": "{{#start_node.platform#}}",
+              "report_type": "daily",
+              "date_basis": "{{#start_node.date_basis#}}",
+              "date_from": "{{#start_node.date_from#}}",
+              "date_to": "{{#start_node.date_to#}}",
+              "account_ids_csv": "{{#start_node.account_ids_csv#}}",
+              "sample_limit": 5,
+              "max_description_chars": 240,
+              "focus": "{{#start_node.focus#}}"
+            }
+          type: json
+        desc: 从 Job Help API 拉取给 LLM 用的结构化分析数据包
+        headers: |
+          Content-Type: application/json
+        method: post
+        params: ''
+        selected: false
+        ssl_verify: false
+        timeout:
+          max_connect_timeout: 0
+          max_read_timeout: 0
+          max_write_timeout: 0
+        title: 获取分析数据包
+        type: http-request
+        url: http://host.docker.internal:8000/api/analysis/report-pack
+      height: 160
+      id: fetch_report_pack
+      position:
+        x: 402
+        y: 282
+      positionAbsolute:
+        x: 402
+        y: 282
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: 根据结构化数据包输出稳定日报
+        memory:
+          query_prompt_template: ''
+          role_prefix:
+            assistant: ''
+            user: ''
+          window:
+            enabled: false
+            size: 10
+        model:
+          completion_params:
+            temperature: 0.2
+          mode: chat
+          name: gpt-4o-mini
+          provider: openai
+        prompt_template:
+        - role: system
+          text: |
+            你是“求职投递数据分析师”。
+
+            你只能基于输入数据包分析，不允许编造任何未提供的信息。
+            你必须严格区分“事实”和“推断”。
+            如果数据不足，明确写“样本不足”。
+            每条核心结论尽量引用数字、比例、原因分布或样本岗位。
+            建议必须可执行，且只给 3 到 5 条。
+            如果数据质量提示中出现 mixed_salary_units 或 suspicious_salary_values，需要在报告里显式提醒。
+
+            请输出严格 Markdown，结构固定为：
+
+            # 今日概览
+            # 核心发现
+            ## 事实
+            ## 推断
+            # 岗位市场特征
+            # 技能标签趋势
+            # 投递效果分析
+            # 高价值机会
+            # 风险与问题
+            # 明日建议
+
+            明日建议必须使用 1. 2. 3. 的编号格式。
+
+            用户关注重点：
+            {{#start_node.focus#}}
+
+            分析数据包：
+            {{#fetch_report_pack.body#}}
+        selected: false
+        title: 生成日报
+        type: llm
+        vision:
+          enabled: false
+      height: 98
+      id: generate_report
+      position:
+        x: 724
+        y: 282
+      positionAbsolute:
+        x: 724
+        y: 282
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 输出日报正文和原始数据包，方便你在 Dify 里对照调试
+        outputs:
+        - value_selector:
+          - generate_report
+          - text
+          variable: report_markdown
+        - value_selector:
+          - fetch_report_pack
+          - body
+          variable: report_pack_json
+        selected: false
+        title: 结束
+        type: end
+      height: 116
+      id: end_node
+      position:
+        x: 1046
+        y: 282
+      positionAbsolute:
+        x: 1046
+        y: 282
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
