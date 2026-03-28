@@ -196,7 +196,12 @@ async def stream_preview(platform: Platform) -> StreamingResponse:
 
 @router.post("/tasks/start", response_model=TaskStatusResponse)
 def start_task(payload: StartTaskRequest) -> TaskStatusResponse:
-    return task_runner.start(payload)
+    try:
+        return task_runner.start(payload)
+    except RuntimeError as exc:
+        if str(exc) == "该账号浏览器配置窗口正在占用同一浏览器配置目录，请先关闭浏览器配置后再启动任务。":
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise
 
 
 @router.post("/tasks/stop", response_model=TaskStatusResponse)

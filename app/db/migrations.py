@@ -73,10 +73,14 @@ def run_migrations() -> None:
         ("rule_configs", "cross_account_dedupe_enabled", "BOOLEAN DEFAULT 0"),
         ("rule_configs", "dedupe_match_by_title", "BOOLEAN DEFAULT 1"),
         ("rule_configs", "dedupe_match_by_company", "BOOLEAN DEFAULT 1"),
+        ("rule_configs", "enable_company_blacklist", "BOOLEAN DEFAULT 0"),
+        ("rule_configs", "company_blacklist", "TEXT DEFAULT ''"),
         ("jobs", "education_text", "VARCHAR(80) DEFAULT ''"),
     ]
 
     for table_name, column_name, column_type in additions:
+        if not _has_table(table_name):
+            continue
         if not _has_column(table_name, column_name):
             statements.append(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 

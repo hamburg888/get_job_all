@@ -1,4 +1,5 @@
 import contextlib
+import json
 import logging
 import threading
 import time
@@ -10,6 +11,7 @@ import sys
 from sqlalchemy import desc, select
 
 from app.automation.adapters.boss_adapter import BossAdapter
+from app.automation.adapters.liepin_adapter import LiepinAdapter
 from app.automation.adapters.qiancheng_adapter import QianchengAdapter
 from app.automation.adapters.zhilian_adapter import ZhilianAdapter, ZhilianDailyLimitReached
 from app.core.config import settings
@@ -29,6 +31,7 @@ from app.models.entities import (
 )
 from app.schemas.common import StartTaskRequest, TaskStatusResponse
 from app.services.live_preview_service import live_preview_service
+from app.services.account_browser_service import account_browser_service
 from app.services.account_service import get_account
 
 logger = logging.getLogger(__name__)
@@ -58,6 +61,26 @@ class TaskRunner:
             return "默认搜索页"
         return ""
 
+    @staticmethod
+    def _normalize_text_filters(values: list[str]) -> list[str]:
+        normalized_items: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            item = " ".join(str(value or "").strip().split())
+            if not item:
+                continue
+            item_key = item.lower()
+            if item_key in seen:
+                continue
+            seen.add(item_key)
+            normalized_items.append(item)
+        return normalized_items
+
+    @staticmethod
+    def _ensure_account_profile_available(account: Account) -> None:
+        if account_browser_service.is_profile_occupied(account.profile_dir):
+            raise RuntimeError("该账号浏览器配置窗口正在占用同一浏览器配置目录，请先关闭浏览器配置后再启动任务。")
+
     def start(self, payload: StartTaskRequest) -> TaskStatusResponse:
         platform_key = payload.platform.value
         with self._lock:
@@ -67,12 +90,18 @@ class TaskRunner:
 
             with SessionLocal() as db:
                 account = self._resolve_account(db, payload)
-                auto_send_chat = payload.auto_send_chat if payload.platform == Platform.BOSS else False
-                chat_template = payload.chat_template if payload.platform == Platform.BOSS else ""
+                self._ensure_account_profile_available(account)
+                supports_chat = payload.platform == Platform.BOSS
+                auto_send_chat = payload.auto_send_chat if supports_chat else False
+                chat_template = payload.chat_template if supports_chat else ""
+                normalized_company_blacklist = self._normalize_text_filters(payload.company_blacklist)
+                payload.company_blacklist = normalized_company_blacklist
                 rule = db.scalar(select(RuleConfig).where(RuleConfig.platform == platform_key).limit(1))
                 if rule:
                     rule.keyword = ",".join(payload.keywords or payload.search_terms)
                     rule.city = ",".join(payload.cities)
+                    rule.enable_company_blacklist = payload.enable_company_blacklist
+                    rule.company_blacklist = json.dumps(normalized_company_blacklist, ensure_ascii=False)
                     rule.salary_min = payload.salary_min
                     rule.salary_max = payload.salary_max
                     rule.cooldown_days = payload.cooldown_days
@@ -86,6 +115,8 @@ class TaskRunner:
                         platform=platform_key,
                         keyword=",".join(payload.keywords or payload.search_terms),
                         city=",".join(payload.cities),
+                        enable_company_blacklist=payload.enable_company_blacklist,
+                        company_blacklist=json.dumps(normalized_company_blacklist, ensure_ascii=False),
                         salary_min=payload.salary_min,
                         salary_max=payload.salary_max,
                         cooldown_days=payload.cooldown_days,
@@ -130,7 +161,9 @@ class TaskRunner:
                             f"live_preview_enabled={payload.live_preview_enabled}, "
                             f"use_manual_entry_url={payload.use_manual_entry_url}, "
                             f"entry_url={payload.manual_entry_url or '-'}, "
-                            f"search_terms={','.join(payload.search_terms) or '-'}"
+                            f"search_terms={','.join(payload.search_terms) or '-'}, "
+                            f"enable_company_blacklist={payload.enable_company_blacklist}, "
+                            f"company_blacklist_count={len(normalized_company_blacklist)}"
                         ),
                         extra_json={
                             "account_id": payload.account_id,
@@ -139,6 +172,8 @@ class TaskRunner:
                             "use_manual_entry_url": payload.use_manual_entry_url,
                             "manual_entry_url": payload.manual_entry_url,
                             "search_terms": payload.search_terms,
+                            "enable_company_blacklist": payload.enable_company_blacklist,
+                            "company_blacklist": normalized_company_blacklist,
                         },
                     )
                 )
@@ -286,8 +321,10 @@ class TaskRunner:
                 self._run_zhilian(task_run_id, payload, stop_event)
             elif payload.platform == Platform.QIANCHENG:
                 self._run_qiancheng(task_run_id, payload, stop_event)
-            else:
+            elif payload.platform == Platform.BOSS:
                 self._run_boss(task_run_id, payload, stop_event)
+            else:
+                self._run_liepin(task_run_id, payload, stop_event)
             final_status = TaskStatus.STOPPED if stop_event.is_set() else TaskStatus.COMPLETED
             final_step = "任务已停止" if stop_event.is_set() else "任务执行完成"
             self._set_status(task_run_id, final_status, final_step)
@@ -699,6 +736,216 @@ class TaskRunner:
             self._set_status(task_run_id, TaskStatus.RUNNING, "模拟执行前程无忧搜索与投递流程")
             adapter.run_sync_mock(",".join(payload.search_terms), process_job, stop_event.is_set)
 
+    def _run_liepin(self, task_run_id: int, payload: StartTaskRequest, stop_event: threading.Event) -> None:
+        adapter = LiepinAdapter()
+        with self._lock:
+            worker = self._workers.get(payload.platform.value)
+            if worker and worker.task_run_id == task_run_id:
+                worker.force_stop = adapter.request_stop
+        with SessionLocal() as db:
+            account = self._resolve_account(db, payload)
+
+        def update_step(message: str) -> None:
+            with SessionLocal() as db:
+                task = db.get(TaskRun, task_run_id)
+                if not task:
+                    return
+                self._assign_current_step(task, message)
+                db.add(
+                    TaskLog(
+                        platform=payload.platform.value,
+                        task_run_id=task.id,
+                        event_type="task_progress",
+                        message=message,
+                    )
+                )
+                db.commit()
+            live_preview_service.update_status(
+                payload.platform,
+                task_run_id=task_run_id,
+                current_step=message,
+                message=message,
+            )
+
+        def wait_for_login_confirmation() -> bool:
+            while not stop_event.is_set():
+                worker_state = self._workers.get(payload.platform.value)
+                if worker_state and worker_state.login_confirm_event.is_set():
+                    worker_state.login_confirm_event.clear()
+                    return True
+                time.sleep(0.5)
+            return False
+
+        def process_job(job_payload: dict) -> None:
+            if stop_event.is_set():
+                return
+            with SessionLocal() as db:
+                task = db.get(TaskRun, task_run_id)
+                if not task:
+                    return
+                self._assign_current_step(task, f"处理中: {job_payload['title']}")
+                task.processed_count += 1
+
+                filter_result = self._match_filters(job_payload, payload)
+                already_delivered = bool(job_payload.get("already_delivered", False))
+                delivery_status = (
+                    DeliveryStatus.SKIPPED.value
+                    if not filter_result["matched"] or already_delivered
+                    else DeliveryStatus.DELIVERED.value
+                    if job_payload.get("delivery_success", False)
+                    else DeliveryStatus.FAILED.value
+                )
+                status_reason = (
+                    filter_result["reason"]
+                    if not filter_result["matched"]
+                    else job_payload.get("status_reason", "猎聘继续聊完成")
+                )
+
+                existing_job = db.scalar(
+                    select(Job).where(
+                        Job.platform == payload.platform.value,
+                        Job.platform_job_id == job_payload["platform_job_id"],
+                    )
+                )
+                if existing_job:
+                    existing_job.title = job_payload["title"]
+                    existing_job.company_name = job_payload["company_name"]
+                    existing_job.salary_text = job_payload["salary_text"]
+                    existing_job.salary_min = job_payload.get("salary_min")
+                    existing_job.salary_max = job_payload.get("salary_max")
+                    existing_job.city = job_payload.get("city", payload.cities[0] if payload.cities else "")
+                    existing_job.experience_text = job_payload.get("experience_text", "不限")
+                    existing_job.education_text = job_payload.get("education_text", "未标注")
+                    existing_job.description = job_payload.get("description", "")
+                    existing_job.detail_url = job_payload.get("detail_url", "")
+                    existing_job.tags = job_payload.get("tags", [])
+                    existing_job.latest_status = delivery_status
+                    existing_job.task_run_id = task.id
+                    job = existing_job
+                else:
+                    job = Job(
+                        platform=payload.platform.value,
+                        platform_job_id=job_payload["platform_job_id"],
+                        title=job_payload["title"],
+                        company_name=job_payload["company_name"],
+                        salary_text=job_payload.get("salary_text", "未标注"),
+                        salary_min=job_payload.get("salary_min"),
+                        salary_max=job_payload.get("salary_max"),
+                        city=job_payload.get("city", payload.cities[0] if payload.cities else ""),
+                        experience_text=job_payload.get("experience_text", "不限"),
+                        education_text=job_payload.get("education_text", "未标注"),
+                        description=job_payload.get("description", ""),
+                        detail_url=job_payload.get("detail_url", ""),
+                        tags=job_payload.get("tags", []),
+                        latest_status=delivery_status,
+                        task_run_id=task.id,
+                    )
+                    db.add(job)
+                    db.flush()
+
+                delivery = DeliveryRecord(
+                    job_id=job.id,
+                    task_run_id=task.id,
+                    account_id=task.account_id,
+                    platform=payload.platform.value,
+                    status=delivery_status,
+                    status_reason=status_reason,
+                    send_status=self._initial_chat_send_status(payload, job_payload, delivery_status),
+                    chat_hr_name=str(job_payload.get("recruiter_name", "") or ""),
+                    chat_sent=bool(job_payload.get("chat_sent", False)),
+                    chat_message=str(job_payload.get("chat_message", "") or ""),
+                )
+                db.add(delivery)
+                if not filter_result["matched"]:
+                    task.failed_count += 1
+                elif already_delivered:
+                    pass
+                elif job_payload.get("delivery_success", False):
+                    task.delivered_count += 1
+                else:
+                    task.failed_count += 1
+
+                db.add(
+                    TaskLog(
+                        platform=payload.platform.value,
+                        task_run_id=task.id,
+                        event_type="job_processed",
+                        message=(
+                            f" {job_payload.get('search_term', '')} | "
+                            f"{job.title} / {job.company_name} / {delivery.status} / {status_reason}"
+                        ),
+                        extra_json={
+                            "detail_url": job.detail_url,
+                            "platform_job_id": job.platform_job_id,
+                            "search_term": job_payload.get("search_term"),
+                            "reason": status_reason,
+                            "chat_sent": bool(job_payload.get("chat_sent", False)),
+                            "send_status": delivery.send_status,
+                        },
+                    )
+                )
+                db.commit()
+            time.sleep(1)
+
+        if settings.automation_mode == "playwright":
+            import asyncio
+
+            if sys.platform == "win32":
+                loop = asyncio.ProactorEventLoop()
+                try:
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(
+                        adapter.run_search_flow(
+                            payload.search_terms,
+                            account.profile_dir,
+                            process_job,
+                            stop_event.is_set,
+                            update_step,
+                            wait_for_login_confirmation,
+                            entry_url=payload.manual_entry_url if payload.use_manual_entry_url else None,
+                            task_run_id=task_run_id,
+                            headless=payload.headless_enabled,
+                            live_preview_enabled=payload.live_preview_enabled,
+                            live_preview_interval_ms=payload.live_preview_interval_ms,
+                            delivery_interval_seconds=payload.delivery_interval_seconds,
+                            max_deliveries_per_run=payload.max_deliveries_per_run,
+                            auto_send_chat=payload.auto_send_chat,
+                            use_chat_template=payload.use_chat_template,
+                            chat_message_template=payload.chat_template,
+                            enable_image_resume=payload.enable_image_resume,
+                            image_resume_path=payload.image_resume_path,
+                        )
+                    )
+                finally:
+                    loop.close()
+                    asyncio.set_event_loop(None)
+            else:
+                asyncio.run(
+                    adapter.run_search_flow(
+                        payload.search_terms,
+                        account.profile_dir,
+                        process_job,
+                        stop_event.is_set,
+                        update_step,
+                        wait_for_login_confirmation,
+                        entry_url=payload.manual_entry_url if payload.use_manual_entry_url else None,
+                        task_run_id=task_run_id,
+                        headless=payload.headless_enabled,
+                        live_preview_enabled=payload.live_preview_enabled,
+                        live_preview_interval_ms=payload.live_preview_interval_ms,
+                        delivery_interval_seconds=payload.delivery_interval_seconds,
+                        max_deliveries_per_run=payload.max_deliveries_per_run,
+                        auto_send_chat=payload.auto_send_chat,
+                        use_chat_template=payload.use_chat_template,
+                        chat_message_template=payload.chat_template,
+                        enable_image_resume=payload.enable_image_resume,
+                        image_resume_path=payload.image_resume_path,
+                    )
+                )
+        else:
+            self._set_status(task_run_id, TaskStatus.RUNNING, "模拟执行猎聘搜索与继续聊流程")
+            adapter.run_sync_mock(",".join(payload.search_terms), process_job, stop_event.is_set)
+
     def _run_boss(self, task_run_id: int, payload: StartTaskRequest, stop_event: threading.Event) -> None:
         adapter = BossAdapter()
         with self._lock:
@@ -809,7 +1056,7 @@ class TaskRunner:
                     platform=payload.platform.value,
                     status=delivery_status,
                     status_reason=status_reason,
-                    send_status=self._initial_boss_send_status(payload, job_payload, delivery_status),
+                    send_status=self._initial_chat_send_status(payload, job_payload, delivery_status),
                     chat_hr_name="",
                     chat_sent=bool(job_payload.get("chat_sent", False)),
                     chat_message=job_payload.get("chat_message", ""),
@@ -1024,15 +1271,22 @@ class TaskRunner:
             if job_city and not any(city.strip() and city.strip() in job_city for city in payload.cities):
                 return {"matched": False, "reason": f"城市不匹配: {job_city}"}
 
+        company_blacklist_result = self._match_company_blacklist(job_payload, payload)
+        if company_blacklist_result is not None:
+            return company_blacklist_result
+
         if payload.keywords:
-            haystack = " ".join(
-                [
-                    job_payload.get("title", ""),
-                    job_payload.get("description", ""),
-                    job_payload.get("company_name", ""),
-                    " ".join(job_payload.get("tags", [])),
-                ]
-            ).lower()
+            if payload.platform == Platform.QIANCHENG:
+                haystack = str(job_payload.get("title", "") or "").lower()
+            else:
+                haystack = " ".join(
+                    [
+                        job_payload.get("title", ""),
+                        job_payload.get("description", ""),
+                        job_payload.get("company_name", ""),
+                        " ".join(job_payload.get("tags", [])),
+                    ]
+                ).lower()
             if not any(keyword.lower() in haystack for keyword in payload.keywords):
                 return {"matched": False, "reason": "未命中关键词筛选"}
 
@@ -1048,6 +1302,25 @@ class TaskRunner:
                 return {"matched": False, "reason": f"活跃度不匹配: {recruiter_status}"}
 
         return {"matched": True, "reason": "命中过滤条件"}
+
+    def _match_company_blacklist(
+        self, job_payload: dict, payload: StartTaskRequest
+    ) -> dict[str, str | bool] | None:
+        if not payload.enable_company_blacklist:
+            return None
+
+        company_name = " ".join(str(job_payload.get("company_name", "") or "").strip().split())
+        if not company_name:
+            return None
+
+        normalized_company_name = company_name.lower()
+        for blacklist_item in self._normalize_text_filters(payload.company_blacklist):
+            if blacklist_item.lower() in normalized_company_name:
+                return {
+                    "matched": False,
+                    "reason": f"公司黑名单命中: {company_name}（关键词: {blacklist_item}）",
+                }
+        return None
 
     def _match_salary_range(self, job_payload: dict, payload: StartTaskRequest) -> dict[str, str | bool] | None:
         expected_min = payload.salary_min
@@ -1107,6 +1380,8 @@ class TaskRunner:
             return ZhilianAdapter.normalize_salary(raw_salary_text)
         if platform == Platform.QIANCHENG:
             return QianchengAdapter.normalize_salary(raw_salary_text)
+        if platform == Platform.LIEPIN:
+            return LiepinAdapter.normalize_salary(raw_salary_text)
         return BossAdapter.normalize_salary(raw_salary_text)
 
     def _normalize_boss_activity_status(self, raw_status: str) -> str:
@@ -1140,9 +1415,12 @@ class TaskRunner:
             return "本月活跃"
         return status
 
-    def _initial_boss_send_status(self, payload: StartTaskRequest, job_payload: dict, delivery_status: str) -> str:
+    def _initial_chat_send_status(self, payload: StartTaskRequest, job_payload: dict, delivery_status: str) -> str:
         if delivery_status != DeliveryStatus.DELIVERED.value:
             return ChatSendStatus.SKIPPED.value
+        existing_send_status = str(job_payload.get("send_status", "") or "").strip()
+        if existing_send_status:
+            return existing_send_status
         if not payload.auto_send_chat:
             return ChatSendStatus.SKIPPED.value
         if bool(job_payload.get("chat_sent", False)):

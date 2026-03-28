@@ -50,6 +50,8 @@ class StartTaskRequest(BaseModel):
     manual_entry_url: str = ""
     keywords: list[str] = Field(default_factory=list)
     cities: list[str] = Field(default_factory=list)
+    enable_company_blacklist: bool = False
+    company_blacklist: list[str] = Field(default_factory=list)
     salary_min: int | None = None
     salary_max: int | None = None
     cooldown_days: int = 7

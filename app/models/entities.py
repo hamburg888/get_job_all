@@ -10,6 +10,7 @@ from app.db.database import Base
 
 class Platform(StrEnum):
     BOSS = "boss"
+    LIEPIN = "liepin"
     QIANCHENG = "qiancheng"
     ZHILIAN = "zhilian"
 
@@ -44,6 +45,8 @@ class RuleConfig(Base):
     platform: Mapped[str] = mapped_column(String(20), index=True)
     keyword: Mapped[str] = mapped_column(String(120))
     city: Mapped[str] = mapped_column(String(60), default="")
+    enable_company_blacklist: Mapped[bool] = mapped_column(Boolean, default=False)
+    company_blacklist: Mapped[str] = mapped_column(Text, default="")
     salary_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
     salary_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cooldown_days: Mapped[int] = mapped_column(Integer, default=7)

@@ -32,6 +32,7 @@ class BrowserConfigState:
     chrome_pid: int | None = None
     debug_port: int | None = None
     platform: str | None = None
+    profile_dir: str | None = None
 
 
 class AccountBrowserService:
@@ -39,6 +40,21 @@ class AccountBrowserService:
         self._sessions: dict[int, BrowserConfigState] = {}
         self._lock = threading.Lock()
         self._instrumented_pages: set[int] = set()
+
+    @staticmethod
+    def _normalize_profile_dir(profile_dir: str) -> str:
+        profile_path = Path(profile_dir)
+        if not profile_path.is_absolute():
+            profile_path = Path.cwd() / profile_path
+        return str(profile_path.resolve())
+
+    def is_profile_occupied(self, profile_dir: str) -> bool:
+        normalized_profile_dir = self._normalize_profile_dir(profile_dir)
+        with self._lock:
+            return any(
+                state.thread.is_alive() and state.profile_dir == normalized_profile_dir
+                for state in self._sessions.values()
+            )
 
     def open_for_account(self, account: Account) -> dict:
         with self._lock:
@@ -61,6 +77,7 @@ class AccountBrowserService:
                 stop_event=stop_event,
                 started_event=started_event,
                 platform=account.platform,
+                profile_dir=self._normalize_profile_dir(account.profile_dir),
             )
             self._sessions[account.id] = state
             state.thread.start()
@@ -108,9 +125,7 @@ class AccountBrowserService:
         try:
             platform = Platform(platform_value)
             entry_url = self._platform_entry_url(platform)
-            profile_path = Path(profile_dir)
-            if not profile_path.is_absolute():
-                profile_path = Path.cwd() / profile_path
+            profile_path = Path(self._normalize_profile_dir(profile_dir))
             profile_path.mkdir(parents=True, exist_ok=True)
 
             chrome_path = self._resolve_chrome_executable()
@@ -473,6 +488,8 @@ class AccountBrowserService:
 
     @staticmethod
     def _platform_entry_url(platform: Platform) -> str:
+        if platform == Platform.LIEPIN:
+            return settings.liepin_login_url
         if platform == Platform.ZHILIAN:
             return settings.zhilian_entry_url
         if platform == Platform.QIANCHENG:

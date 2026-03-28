@@ -5,11 +5,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
+from app.db.runtime_support import ensure_runtime_database
 
 
 class Base(DeclarativeBase):
     pass
 
+
+ensure_runtime_database(settings.database_url, settings.desktop_db_template_path)
 
 engine = create_engine(
     settings.database_url,

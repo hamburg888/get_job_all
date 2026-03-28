@@ -20,6 +20,9 @@ test-results/
 
 logs/
 *.log
+frontend_dist/
+dist_desktop/
+build/
 
 .pytest_cache/
 .mypy_cache/
