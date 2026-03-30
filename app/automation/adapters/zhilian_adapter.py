@@ -15,6 +15,7 @@ import urllib.request
 from urllib.parse import urljoin, urlparse
 
 from app.core.config import settings
+from app.automation.async_runner import run_async_blocking
 from app.automation.browser_factory import (
     LAODENG_INIT_SCRIPT,
     STEALTH_INIT_SCRIPT,
@@ -1222,3 +1223,549 @@ class ZhilianAdapter:
                 break
             per_job_callback(sample)
             asyncio.run(asyncio.sleep(1.2))
+
+    def import_resume_snapshot(
+        self,
+        profile_dir: str,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://i.zhaopin.com/resume",
+    ) -> dict:
+        return run_async_blocking(self._import_resume_snapshot(profile_dir, headless=headless, target_url=target_url))
+
+    def sync_master_resume(
+        self,
+        profile_dir: str,
+        master_resume: dict,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://i.zhaopin.com/resume",
+    ) -> dict:
+        return run_async_blocking(
+            self._sync_master_resume(
+                profile_dir,
+                master_resume,
+                headless=headless,
+                target_url=target_url,
+            )
+        )
+
+    async def _sync_master_resume(
+        self,
+        profile_dir: str,
+        master_resume: dict,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://i.zhaopin.com/resume",
+    ) -> dict:
+        from playwright.async_api import async_playwright
+
+        payload = self._build_resume_sync_payload(master_resume)
+        launch_headless = settings.browser_headless if headless is None else headless
+        use_persistent_context = bool(launch_headless and not settings.browser_fake_headless)
+
+        async with async_playwright() as playwright:
+            browser = None
+            chrome_pid: int | None = None
+            if use_persistent_context:
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **build_browser_launch_options(launch_headless),
+                )
+            else:
+                chrome_path = self._resolve_chrome_executable()
+                profile_path = Path(profile_dir)
+                if not profile_path.is_absolute():
+                    profile_path = Path.cwd() / profile_path
+                profile_path.mkdir(parents=True, exist_ok=True)
+
+                debug_port = self._pick_free_port()
+                chrome_pid = self._launch_external_chrome(
+                    chrome_path,
+                    profile_path,
+                    debug_port,
+                    target_url,
+                    launch_options=build_browser_launch_options(launch_headless),
+                )
+                ws_endpoint = self._wait_for_cdp_endpoint(debug_port, timeout=20, should_stop=lambda: False)
+                if not ws_endpoint:
+                    raise RuntimeError("智联简历同步浏览器已启动，但未能连接到调试端口。")
+                browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
+            await context.add_init_script(LAODENG_INIT_SCRIPT)
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_timeout(1500)
+                if await self.is_login_required(page):
+                    raise RuntimeError("智联当前未登录，请先在账号配置浏览器中完成登录后再同步。")
+
+                updated_sections: list[str] = []
+                detail_messages: list[str] = []
+
+                if payload["summary"]:
+                    summary_result = await page.evaluate(
+                        """async ({ summary }) => {
+                            const vm = document.querySelector('.zp-evalution.diagnosis-scroll__update-selfevaluate.jump-to')?.__vue__;
+                            if (!vm) {
+                                throw new Error('未找到智联个人优势模块。');
+                            }
+                            if (typeof vm.editEvaluate === 'function') {
+                                vm.editEvaluate();
+                                await new Promise((resolve) => setTimeout(resolve, 300));
+                            }
+                            vm.selfEvaContent = summary;
+                            await vm.updateEvaluate();
+                            return { updated: true };
+                        }""",
+                        {"summary": payload["summary"]},
+                    )
+                    if summary_result.get("updated"):
+                        updated_sections.append("个人优势")
+
+                intention_result = await page.evaluate(
+                    """async ({ payload }) => {
+                        const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                        const lower = (value) => normalize(value).toLowerCase();
+                        const cleanLocation = (value) =>
+                            normalize(value)
+                                .split(/[·\\-]/)[0]
+                                .replace(/市辖区|地区|特别行政区/g, '')
+                                .trim();
+                        const unique = (items) => {
+                            const result = [];
+                            const seen = new Set();
+                            for (const item of items || []) {
+                                const value = normalize(item);
+                                if (!value) continue;
+                                const key = value.toLowerCase();
+                                if (seen.has(key)) continue;
+                                seen.add(key);
+                                result.push(value);
+                            }
+                            return result;
+                        };
+                        const provinceMap = {
+                            '北京': { code: 530, name: '北京', type: 'MUNICIPALITY' },
+                            '上海': { code: 538, name: '上海', type: 'MUNICIPALITY' },
+                            '天津': { code: 531, name: '天津', type: 'MUNICIPALITY' },
+                            '重庆': { code: 801, name: '重庆', type: 'MUNICIPALITY' },
+                            '广东': { code: 548, name: '广东', type: 'PROVINCE' },
+                            '广州': { code: 548, name: '广东', type: 'PROVINCE' },
+                            '深圳': { code: 548, name: '广东', type: 'PROVINCE' },
+                            '佛山': { code: 548, name: '广东', type: 'PROVINCE' },
+                            '东莞': { code: 548, name: '广东', type: 'PROVINCE' },
+                            '珠海': { code: 548, name: '广东', type: 'PROVINCE' },
+                            '惠州': { code: 548, name: '广东', type: 'PROVINCE' },
+                            '中山': { code: 548, name: '广东', type: 'PROVINCE' },
+                            '江苏': { code: 639, name: '江苏', type: 'PROVINCE' },
+                            '南京': { code: 639, name: '江苏', type: 'PROVINCE' },
+                            '苏州': { code: 639, name: '江苏', type: 'PROVINCE' },
+                            '杭州': { code: 653, name: '浙江', type: 'PROVINCE' },
+                            '宁波': { code: 653, name: '浙江', type: 'PROVINCE' },
+                            '浙江': { code: 653, name: '浙江', type: 'PROVINCE' },
+                            '湖北': { code: 763, name: '湖北', type: 'PROVINCE' },
+                            '武汉': { code: 763, name: '湖北', type: 'PROVINCE' },
+                            '湖南': { code: 765, name: '湖南', type: 'PROVINCE' },
+                            '长沙': { code: 765, name: '湖南', type: 'PROVINCE' },
+                            '四川': { code: 736, name: '四川', type: 'PROVINCE' },
+                            '成都': { code: 736, name: '四川', type: 'PROVINCE' },
+                            '陕西': { code: 854, name: '陕西', type: 'PROVINCE' },
+                            '西安': { code: 854, name: '陕西', type: 'PROVINCE' },
+                            '河南': { code: 719, name: '河南', type: 'PROVINCE' },
+                            '郑州': { code: 719, name: '河南', type: 'PROVINCE' },
+                            '山东': { code: 702, name: '山东', type: 'PROVINCE' },
+                            '济南': { code: 702, name: '山东', type: 'PROVINCE' },
+                            '青岛': { code: 702, name: '山东', type: 'PROVINCE' },
+                            '福建': { code: 681, name: '福建', type: 'PROVINCE' },
+                            '厦门': { code: 681, name: '福建', type: 'PROVINCE' },
+                            '福州': { code: 681, name: '福建', type: 'PROVINCE' },
+                            '安徽': { code: 636, name: '安徽', type: 'PROVINCE' },
+                            '合肥': { code: 636, name: '安徽', type: 'PROVINCE' },
+                            '江西': { code: 685, name: '江西', type: 'PROVINCE' },
+                            '南昌': { code: 685, name: '江西', type: 'PROVINCE' },
+                        };
+                        const wrapperVm = document.querySelector('.resume-wanna-wrapper')?.__vue__;
+                        const vm = wrapperVm?.$children?.[0];
+                        if (!vm) {
+                            throw new Error('未找到智联求职意向模块。');
+                        }
+
+                        const result = { updated: false, salaryUpdated: false, locationUpdated: false, jobNatureUpdated: false };
+                        const salaryMin = payload?.salary_min;
+                        const salaryMax = payload?.salary_max;
+                        const locationToken = unique((payload?.locations || []).map(cleanLocation).filter(Boolean))[0] || '';
+                        const jobTypeText = normalize(payload?.job_type || '');
+
+                        if (salaryMin != null) {
+                            vm.salaryMin = salaryMin;
+                            if (typeof vm.salaryMinChange === 'function') vm.salaryMinChange(salaryMin);
+                        }
+                        if (salaryMax != null) {
+                            vm.salaryMax = salaryMax;
+                            if (typeof vm.salaryMaxChange === 'function') vm.salaryMaxChange(salaryMax);
+                        }
+                        result.salaryUpdated = salaryMin != null || salaryMax != null;
+
+                        if (locationToken) {
+                            const matchedProvince = provinceMap[locationToken];
+                            if (matchedProvince) {
+                                vm.location = [matchedProvince.code];
+                                vm.saveLocation = [{ code: matchedProvince.code, type: matchedProvince.type, name: matchedProvince.name }];
+                                if (typeof vm.regionChange === 'function') {
+                                    vm.regionChange(vm.location, vm.saveLocation);
+                                }
+                                result.locationUpdated = true;
+                            } else if (Array.isArray(vm.saveLocation) && vm.saveLocation.some((item) => lower(item?.name).includes(lower(locationToken)))) {
+                                result.locationUpdated = true;
+                            }
+                        }
+
+                        if (jobTypeText) {
+                            const nextNature = [];
+                            if (jobTypeText.includes('全职')) nextNature.push('2');
+                            if (jobTypeText.includes('实习')) nextNature.push('4');
+                            if (nextNature.length) {
+                                vm.jobNature = nextNature;
+                                if (typeof vm.jobNatureChange === 'function') vm.jobNatureChange(nextNature);
+                                result.jobNatureUpdated = true;
+                            }
+                        }
+
+                        await vm.save();
+                        result.updated = result.salaryUpdated || result.locationUpdated || result.jobNatureUpdated;
+                        return result;
+                    }""",
+                    {"payload": payload},
+                )
+                if intention_result.get("updated"):
+                    updated_sections.append("求职意向")
+                else:
+                    detail_messages.append("智联求职意向未匹配到可更新字段，已保留原值")
+
+                if intention_result.get("locationUpdated") is False and payload["locations"]:
+                    detail_messages.append("智联地区意向暂未匹配成功，已保留原值")
+
+                if not updated_sections:
+                    raise RuntimeError("智联未找到可写回的简历字段，请确认简历页结构没有变化。")
+
+                message = f"智联同步完成：{'、'.join(updated_sections)}已更新"
+                if detail_messages:
+                    message = f"{message}；{'；'.join(dict.fromkeys(detail_messages))}"
+                return {
+                    "updated_sections": updated_sections,
+                    "message": message,
+                }
+            finally:
+                with contextlib.suppress(Exception):
+                    await context.close()
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        await browser.close()
+                self._terminate_chrome_process(chrome_pid)
+
+    async def _import_resume_snapshot(
+        self,
+        profile_dir: str,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://i.zhaopin.com/resume",
+    ) -> dict:
+        from playwright.async_api import async_playwright
+
+        launch_headless = settings.browser_headless if headless is None else headless
+        use_persistent_context = bool(launch_headless and not settings.browser_fake_headless)
+
+        async with async_playwright() as playwright:
+            browser = None
+            chrome_pid: int | None = None
+            if use_persistent_context:
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **build_browser_launch_options(launch_headless),
+                )
+            else:
+                chrome_path = self._resolve_chrome_executable()
+                profile_path = Path(profile_dir)
+                if not profile_path.is_absolute():
+                    profile_path = Path.cwd() / profile_path
+                profile_path.mkdir(parents=True, exist_ok=True)
+
+                debug_port = self._pick_free_port()
+                chrome_pid = self._launch_external_chrome(
+                    chrome_path,
+                    profile_path,
+                    debug_port,
+                    target_url,
+                    launch_options=build_browser_launch_options(launch_headless),
+                )
+                ws_endpoint = self._wait_for_cdp_endpoint(debug_port, timeout=20, should_stop=lambda: False)
+                if not ws_endpoint:
+                    raise RuntimeError("智联简历浏览器已启动，但未能连接到调试端口。")
+                browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
+            await context.add_init_script(LAODENG_INIT_SCRIPT)
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_function(
+                        """() => {
+                            const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+                            return text.includes('在线简历') || text.includes('个人优势') || text.includes('求职意向');
+                        }""",
+                        timeout=12000,
+                    )
+                with contextlib.suppress(Exception):
+                    await page.wait_for_timeout(800)
+                current_url = (page.url or "").lower()
+                if "login" in current_url or "passport" in current_url:
+                    raise RuntimeError("智联当前未登录，请先在账号配置浏览器中完成登录后再导入。")
+                lines = await page.evaluate(
+                    "() => document.body.innerText.split('\\n').map(line => line.trim()).filter(Boolean)"
+                )
+                return self._parse_resume_lines(lines, page.url)
+            finally:
+                with contextlib.suppress(Exception):
+                    await context.close()
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        await browser.close()
+                self._terminate_chrome_process(chrome_pid)
+
+    @staticmethod
+    def _parse_resume_lines(lines: list[str], source_url: str) -> dict:
+        normalized_lines = [re.sub(r"\s+", " ", str(line or "")).strip() for line in lines if str(line or "").strip()]
+
+        def find_index(candidates: list[str], start_at: int = 0) -> int | None:
+            for idx in range(start_at, len(normalized_lines)):
+                if normalized_lines[idx] in candidates:
+                    return idx
+            return None
+
+        def section_slice(names: list[str], next_names: list[str]) -> list[str]:
+            start_idx = find_index(names, content_start)
+            if start_idx is None:
+                return []
+            start = start_idx + 1
+            end = len(normalized_lines)
+            for next_name in next_names:
+                next_idx = find_index([next_name], start)
+                if next_idx is not None:
+                    end = min(end, next_idx)
+            return normalized_lines[start:end]
+
+        def is_date_line(value: str) -> bool:
+            return bool(re.search(r"\d{4}[./-]\d{1,2}\s*-\s*(?:\d{4}[./-]\d{1,2}|至今)", value))
+
+        online_resume_idx = find_index(["在线简历"])
+        content_start = online_resume_idx or 0
+
+        summary_lines = section_slice(["个人优势"], ["求职状态 必填", "求职状态"])
+        status_lines = section_slice(["求职状态 必填", "求职状态"], ["求职意向 必填", "求职意向"])
+        preference_lines = section_slice(["求职意向 必填", "求职意向"], ["教育经历 必填", "教育经历"])
+        education_lines = section_slice(["教育经历 必填", "教育经历"], ["工作／实习经历"])
+        work_lines = section_slice(["工作／实习经历"], ["项目经历"])
+        project_lines = section_slice(["项目经历"], ["培训经历", "语言能力"])
+        language_lines = section_slice(["语言能力"], ["专业技能"])
+        skill_lines = section_slice(["专业技能"], ["证书"])
+        certificate_lines = section_slice(["证书"], ["个人作品", "学生干部经历"])
+        attachment_lines = section_slice(["简历管理"], ["招聘方主动查看权限", "您的简历有"])
+
+        name = ""
+        headline = ""
+        contact_summary = ""
+        for idx, value in enumerate(normalized_lines):
+            if value == "在线简历" and idx + 8 < len(normalized_lines):
+                name = normalized_lines[idx + 2]
+                headline = normalized_lines[idx + 4]
+                contact_summary = " ".join(normalized_lines[idx + 5 : idx + 8])
+                break
+
+        job_preferences = {
+            "desired_role": preference_lines[2] if len(preference_lines) > 2 else "",
+            "salary": preference_lines[3].replace("薪资要求: ", "") if len(preference_lines) > 3 else "",
+            "locations": preference_lines[4].replace("期望城市: ", "") if len(preference_lines) > 4 else "",
+            "job_type": preference_lines[5].replace("工作性质: ", "") if len(preference_lines) > 5 else "",
+            "industry": preference_lines[6].replace("期望行业: ", "") if len(preference_lines) > 6 else "",
+            "job_status": status_lines[0] if status_lines else "",
+            "raw_tokens": preference_lines,
+        }
+
+        education_experiences: list[dict] = []
+        idx = 1 if education_lines[:1] == ["添加教育经历"] else 0
+        while idx < len(education_lines):
+            current = education_lines[idx]
+            collapsed_match = re.match(
+                r"^(?P<school>.+?)\s+(?P<degree>本科|大专|硕士|博士)\s+(?P<major>.+?)(?:\s+(?P<extra>有学位证书|无学位证书))?\s+(?P<date>\d{4}\.\d-\d{4}\.\d|\d{4}\.\d-至今)$",
+                current,
+            )
+            if collapsed_match:
+                school = collapsed_match.group("school").strip()
+                degree = collapsed_match.group("degree").strip()
+                major = collapsed_match.group("major").strip()
+                extra = (collapsed_match.group("extra") or "").strip()
+                date_range = collapsed_match.group("date").strip()
+                idx += 1
+            else:
+                if idx + 3 >= len(education_lines):
+                    break
+                school = education_lines[idx]
+                degree = education_lines[idx + 1]
+                major = education_lines[idx + 2]
+                extra = education_lines[idx + 3]
+                date_range = education_lines[idx + 4] if idx + 4 < len(education_lines) else ""
+                idx += 5
+            education_experiences.append(
+                {
+                    "school": school,
+                    "degree": degree,
+                    "major": major,
+                    "study_mode": extra,
+                    "date_range": date_range,
+                }
+            )
+
+        work_experiences: list[dict] = []
+        idx = 1 if work_lines[:1] == ["添加工作经验"] else 0
+        while idx + 2 < len(work_lines):
+            company = work_lines[idx]
+            date_range = work_lines[idx + 1]
+            title = work_lines[idx + 2]
+            if not is_date_line(date_range):
+                idx += 1
+                continue
+            salary = ""
+            if idx + 3 < len(work_lines) and work_lines[idx + 3].startswith("|"):
+                salary = work_lines[idx + 3].replace("|", "").strip()
+                idx += 1
+            description_parts: list[str] = []
+            tags: list[str] = []
+            idx += 3
+            while idx < len(work_lines):
+                current = work_lines[idx]
+                if idx + 1 < len(work_lines) and is_date_line(work_lines[idx + 1]):
+                    break
+                if current.startswith("职位类别：") or current.startswith("所属行业：") or current == "拥有技能：":
+                    idx += 1
+                    continue
+                if len(current) <= 18 and not current.startswith("项目描述") and not current.startswith("设计") and "：" not in current:
+                    tags.append(current)
+                else:
+                    description_parts.append(current)
+                idx += 1
+            work_experiences.append(
+                {
+                    "company": company,
+                    "date_range": date_range,
+                    "title": title,
+                    "salary": salary,
+                    "tags": tags,
+                    "description": "\n".join(description_parts).strip(),
+                }
+            )
+
+        project_experiences: list[dict] = []
+        idx = 1 if project_lines[:1] == ["添加项目经历"] else 0
+        while idx + 2 < len(project_lines):
+            name_line = project_lines[idx]
+            date_range = project_lines[idx + 1]
+            if not is_date_line(date_range):
+                idx += 1
+                continue
+            idx += 2
+            description_parts: list[str] = []
+            while idx < len(project_lines):
+                current = project_lines[idx]
+                if current == "查看全部":
+                    idx += 1
+                    continue
+                if idx + 1 < len(project_lines) and is_date_line(project_lines[idx + 1]):
+                    break
+                if current == "项目描述":
+                    idx += 1
+                    continue
+                description_parts.append(current)
+                idx += 1
+            project_experiences.append(
+                {"name": name_line, "date_range": date_range, "role": "", "description": "\n".join(description_parts).strip()}
+            )
+
+        skills: list[str] = []
+        for item in skill_lines:
+            if item == "添加专业技能":
+                continue
+            collapsed_skill = re.match(r"^(?P<name>.+?)\s+(熟练|良好|一般)\s+使用时长:", item)
+            if collapsed_skill:
+                skills.append(collapsed_skill.group("name").strip())
+                continue
+            if "使用时长" not in item and item not in {"熟练", "良好", "一般"}:
+                skills.append(item)
+        attachments = []
+        for idx, value in enumerate(attachment_lines):
+            if value.endswith(".pdf") or value.endswith(".doc") or value.endswith(".docx"):
+                attachments.append({"name": value, "meta": attachment_lines[idx + 1] if idx + 1 < len(attachment_lines) else ""})
+
+        return {
+            "source_url": source_url,
+            "full_name": name,
+            "headline": headline,
+            "contact_summary": contact_summary,
+            "wechat_id": "",
+            "summary": "\n".join(summary_lines).strip(),
+            "job_preferences": job_preferences,
+            "work_experiences": work_experiences,
+            "project_experiences": project_experiences,
+            "education_experiences": education_experiences,
+            "certificates": [item for item in certificate_lines if item != "添加证书"],
+            "skills": skills,
+            "languages": [item for item in language_lines if item != "添加语言能力"],
+            "attachments": attachments,
+            "raw_snapshot": {"lines": normalized_lines},
+        }
+
+    @staticmethod
+    def _split_resume_terms(value: str | None) -> list[str]:
+        if not value:
+            return []
+        raw_items = re.split(r"[/|,，、；;\n]+", str(value))
+        results: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            normalized = re.sub(r"\s+", " ", item).strip()
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(normalized)
+        return results
+
+    @classmethod
+    def _build_resume_sync_payload(cls, master_resume: dict) -> dict:
+        job_preferences = dict(master_resume.get("job_preferences", {}) or {})
+        salary_text = str(job_preferences.get("salary") or "").strip()
+        salary_min_k, salary_max_k = cls.normalize_salary(salary_text) if salary_text else (None, None)
+
+        def to_yuan(value: float | None) -> int | None:
+            if value is None:
+                return None
+            return int(round(value * 1000))
+
+        return {
+            "summary": str(master_resume.get("summary") or "").strip(),
+            "job_type": str(job_preferences.get("job_type") or "").strip(),
+            "desired_role": str(job_preferences.get("desired_role") or "").strip(),
+            "locations": cls._split_resume_terms(job_preferences.get("locations")),
+            "salary_text": salary_text,
+            "salary_min": to_yuan(salary_min_k),
+            "salary_max": to_yuan(salary_max_k),
+        }

@@ -320,3 +320,94 @@ class UploadedFileOut(BaseModel):
 class UploadImageRequest(BaseModel):
     file_name: str
     content_base64: str
+
+
+class ResumeImportRequest(BaseModel):
+    source_platform: Platform
+    account_id: int | None = None
+    headless_enabled: bool = False
+
+
+class ResumeSyncRequest(BaseModel):
+    target_platforms: list[Platform] = Field(default_factory=list)
+    account_map: dict[str, int | None] = Field(default_factory=dict)
+    field_selection: dict[str, bool] = Field(default_factory=dict)
+
+
+class MasterResumeUpdateRequest(BaseModel):
+    full_name: str = ""
+    headline: str = ""
+    contact_summary: str = ""
+    wechat_id: str = ""
+    summary: str = ""
+    job_preferences: dict[str, Any] = Field(default_factory=dict)
+    work_experiences: list[dict[str, Any]] = Field(default_factory=list)
+    project_experiences: list[dict[str, Any]] = Field(default_factory=list)
+    education_experiences: list[dict[str, Any]] = Field(default_factory=list)
+    certificates: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=list)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    raw_snapshot: dict[str, Any] = Field(default_factory=dict)
+
+
+class MasterResumeOut(BaseModel):
+    id: int
+    source_platform: str
+    source_account_id: int | None = None
+    source_label: str
+    source_url: str
+    full_name: str
+    headline: str
+    contact_summary: str
+    wechat_id: str
+    summary: str
+    job_preferences: dict[str, Any] = Field(default_factory=dict)
+    work_experiences: list[dict[str, Any]] = Field(default_factory=list)
+    project_experiences: list[dict[str, Any]] = Field(default_factory=list)
+    education_experiences: list[dict[str, Any]] = Field(default_factory=list)
+    certificates: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=list)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    raw_snapshot: dict[str, Any] = Field(default_factory=dict)
+    imported_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ResumeImportLogOut(BaseModel):
+    id: int
+    source_platform: str
+    source_account_id: int | None = None
+    status: str
+    message: str
+    extra_json: dict[str, Any] | None = None
+    created_at: datetime
+    finished_at: datetime | None = None
+
+
+class ResumeSyncTargetOut(BaseModel):
+    id: int
+    target_platform: str
+    target_account_id: int | None = None
+    status: str
+    message: str
+    created_at: datetime
+    finished_at: datetime | None = None
+
+
+class ResumeSyncRunOut(BaseModel):
+    id: int
+    master_resume_id: int | None = None
+    status: str
+    message: str
+    created_at: datetime
+    finished_at: datetime | None = None
+    targets: list[ResumeSyncTargetOut] = Field(default_factory=list)
+
+
+class ResumeCenterOut(BaseModel):
+    master_resume: MasterResumeOut | None = None
+    import_logs: list[ResumeImportLogOut] = Field(default_factory=list)
+    sync_runs: list[ResumeSyncRunOut] = Field(default_factory=list)
+    platform_support: dict[str, dict[str, bool]] = Field(default_factory=dict)

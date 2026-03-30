@@ -25,6 +25,10 @@ from app.schemas.common import (
     PaginatedDeliveriesOut,
     PaginatedJobsOut,
     PreviewStateOut,
+    MasterResumeUpdateRequest,
+    ResumeCenterOut,
+    ResumeImportRequest,
+    ResumeSyncRequest,
     StartTaskRequest,
     StatsOut,
     StopTaskRequest,
@@ -37,9 +41,22 @@ from app.services.account_service import create_account, get_account, list_accou
 from app.services.analysis_service import build_analysis_report_pack
 from app.services.dashboard_service import DashboardFilters, get_overview, get_stats, list_deliveries, list_jobs, list_logs
 from app.services.live_preview_service import live_preview_service
+from app.services.resume_sync_service import (
+    get_resume_center,
+    import_resume_from_platform,
+    sync_master_resume_to_platforms,
+    update_master_resume,
+)
 from app.services.task_runner import task_runner
 
 router = APIRouter()
+
+
+def _safe_error_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    if message:
+        return message
+    return f"{exc.__class__.__name__}: {exc!r}"
 
 
 @router.get("/health")
@@ -112,6 +129,46 @@ def upload_boss_chat_image(payload: UploadImageRequest) -> dict:
         "name": payload.file_name or target_path.name,
         "url": f"/uploads/boss_chat_images/{target_path.name}",
     }
+
+
+@router.get("/resume/center", response_model=ResumeCenterOut)
+def resume_center(db: Session = Depends(get_db)) -> dict:
+    return get_resume_center(db)
+
+
+@router.post("/resume/import", response_model=ResumeCenterOut)
+def import_resume(payload: ResumeImportRequest, db: Session = Depends(get_db)) -> dict:
+    try:
+        return import_resume_from_platform(
+            db,
+            payload.source_platform,
+            payload.account_id,
+            headless_enabled=payload.headless_enabled,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=_safe_error_message(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=_safe_error_message(exc)) from exc
+
+
+@router.post("/resume/sync", response_model=ResumeCenterOut)
+def sync_resume(payload: ResumeSyncRequest, db: Session = Depends(get_db)) -> dict:
+    try:
+        return sync_master_resume_to_platforms(db, payload.target_platforms, payload.account_map, payload.field_selection)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=_safe_error_message(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=_safe_error_message(exc)) from exc
+
+
+@router.put("/resume/master", response_model=ResumeCenterOut)
+def update_resume_master(payload: MasterResumeUpdateRequest, db: Session = Depends(get_db)) -> dict:
+    try:
+        return update_master_resume(db, payload.model_dump())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=_safe_error_message(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=_safe_error_message(exc)) from exc
 
 
 def _dashboard_filters(

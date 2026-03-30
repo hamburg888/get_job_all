@@ -20,6 +20,7 @@ from app.automation.browser_factory import (
     STEALTH_INIT_SCRIPT,
     build_browser_launch_options,
 )
+from app.automation.async_runner import run_async_blocking
 from app.core.config import settings
 from app.services.live_preview_service import live_preview_service
 
@@ -2523,13 +2524,27 @@ class BossAdapter:
 
     @staticmethod
     def normalize_salary(raw_salary: str) -> tuple[float | None, float | None]:
-        salary = BossAdapter._decode_boss_salary_text(raw_salary).replace("元", "").replace("万", "w").replace("K", "k").strip()
+        salary = BossAdapter._normalize_salary_text(raw_salary)
         if "-" not in salary:
             value = BossAdapter._parse_salary_part(salary)
             return value, value
         left, right = salary.split("-", maxsplit=1)
         left, right = BossAdapter._inherit_range_units(left, right)
         return BossAdapter._parse_salary_part(left), BossAdapter._parse_salary_part(right)
+
+    @staticmethod
+    def _normalize_salary_text(raw_salary: str) -> str:
+        salary = BossAdapter._decode_boss_salary_text(raw_salary)
+        salary = salary.replace("－", "-").replace("—", "-").replace("–", "-").replace("~", "-")
+        salary = salary.replace("至", "-").replace("到", "-")
+        salary = salary.replace("元", "").replace("千", "k").replace("仟", "k").replace("万", "w")
+        salary = salary.replace("K", "k").replace("W", "w")
+        salary = re.sub(r"[·•xX×＊*]\s*\d+\s*薪", "", salary, flags=re.IGNORECASE)
+        salary = re.sub(r"\d+\s*薪", "", salary, flags=re.IGNORECASE)
+        salary = re.sub(r"(税前|税后|以上|以下|左右|面议|每月|每个月|每年|年薪|月薪|薪资|工资)", "", salary, flags=re.IGNORECASE)
+        salary = re.sub(r"\s*/\s*(月|年)", "", salary, flags=re.IGNORECASE)
+        salary = re.sub(r"\s+", "", salary)
+        return salary.strip("- ")
 
     @staticmethod
     def _parse_salary_part(value: str) -> float | None:
@@ -2672,3 +2687,1529 @@ class BossAdapter:
             return (await locator.inner_text()).strip()
         except Exception:  # noqa: BLE001
             return ""
+
+    def import_resume_snapshot(
+        self,
+        profile_dir: str,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://www.zhipin.com/web/geek/resume",
+    ) -> dict:
+        return run_async_blocking(self._import_resume_snapshot(profile_dir, headless=headless, target_url=target_url))
+
+    def sync_master_resume(
+        self,
+        profile_dir: str,
+        master_resume: dict,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://www.zhipin.com/web/geek/resume",
+    ) -> dict:
+        return run_async_blocking(
+            self._sync_master_resume(
+                profile_dir,
+                master_resume,
+                headless=headless,
+                target_url=target_url,
+            )
+        )
+
+    async def _sync_master_resume(
+        self,
+        profile_dir: str,
+        master_resume: dict,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://www.zhipin.com/web/geek/resume",
+    ) -> dict:
+        from playwright.async_api import async_playwright
+
+        payload = self._build_resume_sync_payload(master_resume)
+        launch_headless = settings.browser_headless if headless is None else headless
+        use_persistent_context = bool(launch_headless and not settings.browser_fake_headless)
+
+        async with async_playwright() as playwright:
+            browser = None
+            chrome_pid: int | None = None
+            if use_persistent_context:
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **build_browser_launch_options(launch_headless),
+                )
+            else:
+                chrome_path = self._resolve_chrome_executable()
+                profile_path = Path(profile_dir)
+                if not profile_path.is_absolute():
+                    profile_path = Path.cwd() / profile_path
+                profile_path.mkdir(parents=True, exist_ok=True)
+
+                debug_port = self._pick_free_port()
+                chrome_pid = self._launch_external_chrome(
+                    chrome_path,
+                    profile_path,
+                    debug_port,
+                    target_url,
+                    launch_options=build_browser_launch_options(launch_headless),
+                )
+                ws_endpoint = self._wait_for_cdp_endpoint(debug_port, timeout=20, should_stop=lambda: False)
+                if not ws_endpoint:
+                    raise RuntimeError("BOSS 简历同步浏览器已启动，但未能连接到调试端口。")
+                browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
+            await context.add_init_script(LAODENG_INIT_SCRIPT)
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_timeout(1500)
+                if await self.is_login_required(page, page):
+                    raise RuntimeError("BOSS 当前未登录，请先在账号配置浏览器中完成登录后再同步。")
+                await self._wait_resume_ready(page)
+
+                updated_sections: list[str] = []
+                detail_messages: list[str] = []
+
+                basic_result = await self._sync_resume_basic_info(page, payload)
+                if basic_result["updated"]:
+                    updated_sections.append("个人信息")
+                detail_messages.extend(basic_result["messages"])
+
+                summary_result = await self._sync_resume_summary(page, payload.get("summary", ""))
+                if summary_result["updated"]:
+                    updated_sections.append("个人优势")
+                detail_messages.extend(summary_result["messages"])
+
+                await self._reload_resume_page(page, target_url)
+                preference_result = await self._sync_resume_expectation(page, payload)
+                if preference_result["updated"]:
+                    updated_sections.append("求职期望")
+                detail_messages.extend(preference_result["messages"])
+
+                work_result = await self._sync_resume_work_experiences(page, payload.get("work_experiences", []))
+                if work_result["updated"]:
+                    updated_sections.append("工作经历")
+                detail_messages.extend(work_result["messages"])
+
+                await self._reload_resume_page(page, target_url)
+                project_result = await self._sync_resume_project_experiences(page, payload.get("project_experiences", []))
+                if project_result["updated"]:
+                    updated_sections.append("项目经历")
+                detail_messages.extend(project_result["messages"])
+
+                await self._reload_resume_page(page, target_url)
+                education_result = await self._sync_resume_education_experiences(
+                    page, payload.get("education_experiences", [])
+                )
+                if education_result["updated"]:
+                    updated_sections.append("教育经历")
+                detail_messages.extend(education_result["messages"])
+
+                await self._reload_resume_page(page, target_url)
+                certificate_result = await self._sync_resume_certificates(page, payload.get("certificates", []))
+                if certificate_result["updated"]:
+                    updated_sections.append("资格证书")
+                detail_messages.extend(certificate_result["messages"])
+
+                await self._reload_resume_page(page, target_url)
+                skill_result = await self._sync_resume_skills(page, payload.get("skills", []))
+                if skill_result["updated"]:
+                    updated_sections.append("专业技能")
+                detail_messages.extend(skill_result["messages"])
+
+                if not updated_sections:
+                    raise RuntimeError("BOSS 未找到可写回的简历字段，请确认简历页结构没有变化。")
+
+                message = f"BOSS 同步完成：{'、'.join(updated_sections)}已更新"
+                if detail_messages:
+                    message = f"{message}；{'；'.join(dict.fromkeys(detail_messages))}"
+                return {
+                    "updated_sections": updated_sections,
+                    "message": message,
+                }
+            finally:
+                with contextlib.suppress(Exception):
+                    await context.close()
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        await browser.close()
+                self._terminate_chrome_process(chrome_pid)
+
+    async def _sync_resume_basic_info(self, page, payload: dict) -> dict:
+        basic_info = dict(payload.get("basic_info") or {})
+        if not any(str(basic_info.get(key) or "").strip() for key in ("full_name", "wechat_id", "email")):
+            return {"updated": False, "messages": []}
+
+        opened = await self._open_resume_editor(page, "个人信息", edit_selector='a.link-edit[ka="user-resume-edit-userinfo"], .resume-baseInfo a.link-edit, .resume-userinfo a.link-edit')
+        if not opened:
+            return {"updated": False, "messages": ["BOSS 个人信息编辑入口未找到，已跳过"]}
+
+        try:
+            result = await page.evaluate(
+                """({ payload }) => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const canReplace = (el, nextValue) => {
+                        const currentValue = normalize(el?.value || '');
+                        const targetValue = normalize(nextValue);
+                        if (!targetValue) return false;
+                        if (!currentValue) return true;
+                        return currentValue === targetValue;
+                    };
+                    const dispatchInput = (el, value) => {
+                        if (!el || el.disabled) return false;
+                        el.focus();
+                        el.value = value;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        return true;
+                    };
+                    const root = Array.from(document.querySelectorAll('*')).find((el) => {
+                        const title = el.querySelector('h3');
+                        return title && normalize(title.textContent) === '编辑个人信息';
+                    });
+                    if (!root) return { ok: false };
+                    const inputs = Array.from(root.querySelectorAll('input[type="text"], input:not([type]), textarea')).filter((el) => el.offsetParent !== null);
+                    const fullNameInput = inputs.find((el) => normalize(el.placeholder).includes('姓名'));
+                    const wechatInput = inputs.find((el) => normalize(el.placeholder).includes('微信号'));
+                    const emailInput = inputs.find((el) => normalize(el.placeholder).includes('邮箱'));
+                    let changed = false;
+                    let skippedFullName = false;
+                    if (payload.full_name && fullNameInput) {
+                        if (canReplace(fullNameInput, payload.full_name)) {
+                            changed = dispatchInput(fullNameInput, payload.full_name) || changed;
+                        } else {
+                            skippedFullName = true;
+                        }
+                    }
+                    if (payload.wechat_id && wechatInput && canReplace(wechatInput, payload.wechat_id)) {
+                        changed = dispatchInput(wechatInput, payload.wechat_id) || changed;
+                    }
+                    if (payload.email && emailInput && canReplace(emailInput, payload.email)) {
+                        changed = dispatchInput(emailInput, payload.email) || changed;
+                    }
+                    return { ok: true, changed, skippedFullName };
+                }""",
+                {"payload": basic_info},
+            )
+        except Exception:
+            await self._dismiss_unsaved_resume_editor(page)
+            return {"updated": False, "messages": ["BOSS 个人信息表单写入失败，已跳过"]}
+
+        if not result.get("ok"):
+            await self._dismiss_unsaved_resume_editor(page)
+            return {"updated": False, "messages": ["BOSS 个人信息表单未成功打开，已跳过"]}
+        if not result.get("changed"):
+            await self._dismiss_unsaved_resume_editor(page)
+            messages = ["BOSS 姓名已存在且不可直接覆盖，已保留原值"] if result.get("skippedFullName") else []
+            return {"updated": False, "messages": messages}
+
+        saved = await self._finish_resume_editor(page, "编辑个人信息")
+        if not saved:
+            return {"updated": False, "messages": ["BOSS 个人信息保存失败，已保留原值"]}
+        messages = ["BOSS 姓名已存在且不可直接覆盖，已保留原值"] if result.get("skippedFullName") else []
+        return {"updated": True, "messages": messages}
+
+    async def _sync_resume_summary(self, page, summary: str) -> dict:
+        summary_text = self._normalize_multiline_text(summary)
+        if not summary_text:
+            return {"updated": False, "messages": []}
+
+        opened = await self._open_resume_editor(page, "个人优势", item_text="擅长领域", edit_selector=".resume-advantage a.link-edit")
+        if not opened:
+            return {"updated": False, "messages": ["BOSS 个人优势编辑入口未找到，已跳过"]}
+
+        try:
+            result = await page.evaluate(
+                """({ summary }) => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const root = Array.from(document.querySelectorAll('*')).find((el) => {
+                        const title = el.querySelector('h3');
+                        return title && normalize(title.textContent) === '编辑个人优势';
+                    });
+                    const textarea = root?.querySelector('textarea');
+                    if (!textarea) return { ok: false };
+                    textarea.focus();
+                    textarea.value = summary;
+                    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                    textarea.dispatchEvent(new Event('change', { bubbles: true }));
+                    return { ok: true };
+                }""",
+                {"summary": summary_text},
+            )
+        except Exception:
+            await self._dismiss_unsaved_resume_editor(page)
+            return {"updated": False, "messages": ["BOSS 个人优势写入失败，已跳过"]}
+
+        if not result.get("ok"):
+            await self._dismiss_unsaved_resume_editor(page)
+            return {"updated": False, "messages": ["BOSS 个人优势表单未成功打开，已跳过"]}
+        saved = await self._finish_resume_editor(page, "编辑个人优势")
+        if not saved:
+            return {"updated": False, "messages": ["BOSS 个人优势保存失败，已保留原值"]}
+        return {"updated": True, "messages": []}
+
+    async def _sync_resume_expectation(self, page, payload: dict) -> dict:
+        if not any(
+            (
+                payload.get("desired_role"),
+                payload.get("locations"),
+                payload.get("salary_min_k") is not None and payload.get("salary_max_k") is not None,
+            )
+        ):
+            return {"updated": False, "messages": []}
+
+        opened = await self._open_resume_editor(
+            page,
+            "期望职位",
+            edit_selector=".resume-expectList a.link-edit, .resume-purpose a.link-edit, a.link-edit[ka^='user-resume-edit-expectation']",
+            add_selector=".resume-expectList a.link-add, .resume-purpose a.link-add",
+        )
+        if not opened:
+            return {"updated": False, "messages": ["BOSS 求职期望编辑入口未找到，已跳过"]}
+
+        try:
+            result = await page.evaluate(
+                """async ({ payload }) => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const lower = (value) => normalize(value).toLowerCase();
+                    const toCode = (item) => {
+                        const value = item?.settingValue ?? item?.value ?? item?.code ?? item?.id ?? null;
+                        if (value == null || value === '') return null;
+                        const numeric = Number(value);
+                        return Number.isFinite(numeric) ? numeric : null;
+                    };
+                    const hasMeaningfulCode = (item) => {
+                        const code = toCode(item);
+                        return code != null && code > 0;
+                    };
+                    const resolvePositionToken = (value) => {
+                        const text = lower(value);
+                        if (!text) return '';
+                        if (['java', '后端', '后台', '服务端', 'golang', 'python', 'php', '全栈', 'full stack', 'fullstack'].some((keyword) => text.includes(keyword))) {
+                            return '后端开发';
+                        }
+                        if (['前端', 'vue', 'react', 'uniapp', '小程序', '移动端', 'android', 'ios'].some((keyword) => text.includes(keyword))) {
+                            return '前端/移动开发';
+                        }
+                        if (['测试', 'qa'].some((keyword) => text.includes(keyword))) {
+                            return '测试';
+                        }
+                        if (['运维', 'devops'].some((keyword) => text.includes(keyword))) {
+                            return '运维/技术支持';
+                        }
+                        return normalize(value);
+                    };
+                    const unique = (items) => {
+                        const result = [];
+                        const seen = new Set();
+                        for (const item of items || []) {
+                            const value = normalize(item);
+                            if (!value) continue;
+                            const key = value.toLowerCase();
+                            if (seen.has(key)) continue;
+                            seen.add(key);
+                            result.push(value);
+                        }
+                        return result;
+                    };
+                    const cleanCityToken = (value) =>
+                        normalize(value).split(/[·\\-]/)[0].replace(/市辖区|地区|特别行政区/g, '').trim();
+                    const getChildren = (item) => item?.subLevelModelList || item?.children || item?.items || [];
+                    const flatten = (items, parents = []) => {
+                        const result = [];
+                        for (const item of items || []) {
+                            result.push({ item, parents });
+                            const children = getChildren(item);
+                            if (children.length) result.push(...flatten(children, parents.concat(item)));
+                        }
+                        return result;
+                    };
+                    const matchNode = (items, token) => {
+                        const normalized = lower(token);
+                        if (!normalized) return null;
+                        let exactFallback = null;
+                        let fuzzy = null;
+                        for (const entry of flatten(items)) {
+                            const name = lower(entry.item?.name || entry.item?.label || entry.item?.text || '');
+                            if (!name) continue;
+                            if (name === normalized) {
+                                if (hasMeaningfulCode(entry.item)) return entry;
+                                exactFallback = exactFallback || entry;
+                                continue;
+                            }
+                            if (!fuzzy && (name.includes(normalized) || normalized.includes(name))) fuzzy = entry;
+                        }
+                        return fuzzy || exactFallback;
+                    };
+                    const vm = document.querySelector('.expectation-form')?.__vue__;
+                    const form = vm?._data?.formData || vm?.formData;
+                    if (!vm || !form) return { ok: false };
+                    const output = { ok: true, updated: false, roleUpdated: false, cityUpdated: false, salaryUpdated: false };
+                    const roleToken = resolvePositionToken(payload?.roles?.[0] || payload?.desired_role || '');
+                    const cityToken = unique((payload?.locations || []).map(cleanCityToken).filter(Boolean))[0] || '';
+                    if (roleToken) {
+                        const role = matchNode(vm._data?.positionList || [], roleToken);
+                        if (role?.item) {
+                            form.positionName = role.item.name || roleToken;
+                            const roleCode = toCode(role.item);
+                            if (roleCode != null) form.position = roleCode;
+                            if (role.item.positionType != null) form.positionType = role.item.positionType;
+                            output.updated = true;
+                            output.roleUpdated = true;
+                        }
+                    }
+                    if (cityToken) {
+                        const city = matchNode(vm._data?.cityOptions || [], cityToken);
+                        if (city?.item) {
+                            const cityCode = toCode(city.item);
+                            form.locationName = city.item.name || cityToken;
+                            if (cityCode != null) form.location = cityCode;
+                            const parentCodes = city.parents.map((item) => toCode(item)).filter((item) => item != null && item !== -1);
+                            if (cityCode != null) form.cityValue = [...parentCodes, cityCode];
+                            output.updated = true;
+                            output.cityUpdated = true;
+                        }
+                    }
+                    if (payload?.salary_min_k != null && payload?.salary_max_k != null && payload.salary_min_k > 0 && payload.salary_max_k >= payload.salary_min_k) {
+                        form.lowSalary = payload.salary_min_k;
+                        form.highSalary = payload.salary_max_k;
+                        form.salaryScope = [payload.salary_min_k, payload.salary_max_k];
+                        form.salaryDesc = `${payload.salary_min_k}k-${payload.salary_max_k}k`;
+                        form.salaryDescNew = `${payload.salary_min_k}k-${payload.salary_max_k}k`;
+                        output.updated = true;
+                        output.salaryUpdated = true;
+                    }
+                    if (output.updated) {
+                        await vm.handleSubmit();
+                        await new Promise((resolve) => setTimeout(resolve, 800));
+                    }
+                    return output;
+                }""",
+                {"payload": payload},
+            )
+        except Exception:
+            await self._dismiss_unsaved_resume_editor(page)
+            return {"updated": False, "messages": ["BOSS 求职期望写入失败，已跳过"]}
+
+        messages: list[str] = []
+        if not result.get("ok"):
+            await self._dismiss_unsaved_resume_editor(page)
+            return {"updated": False, "messages": ["BOSS 求职期望表单未成功打开，已跳过"]}
+        if not result.get("updated"):
+            await self._dismiss_unsaved_resume_editor(page)
+            return {"updated": False, "messages": ["求职期望未匹配到可更新字段，已保留原值"]}
+        if result.get("roleUpdated") is False and payload.get("desired_role"):
+            messages.append("BOSS 期望职位未精确匹配，已保留原值")
+        if result.get("cityUpdated") is False and payload.get("locations"):
+            messages.append("BOSS 工作城市未匹配成功，已保留原值")
+        if result.get("salaryUpdated") is False and payload.get("salary_text"):
+            messages.append("BOSS 薪资未匹配成功，已保留原值")
+        if await self._has_resume_error_dialog(page):
+            await self._dismiss_unsaved_resume_editor(page)
+            messages.append("BOSS 求职期望保存失败，已保留原值")
+            return {"updated": False, "messages": messages}
+        saved = await self._wait_editor_closed(page, "编辑求职期望")
+        if not saved:
+            saved = await self._finish_resume_editor(page, "编辑求职期望")
+        if not saved:
+            await self._dismiss_unsaved_resume_editor(page)
+            messages.append("BOSS 求职期望保存后未正常关闭，已保留原值")
+            return {"updated": False, "messages": messages}
+        return {"updated": True, "messages": messages}
+
+    async def _sync_resume_work_experiences(self, page, items: list[dict]) -> dict:
+        if not items:
+            return {"updated": False, "messages": []}
+
+        updated_count = 0
+        messages: list[str] = []
+        existing_count = await page.locator('a.link-edit[ka^="user-resume-edit-workexp"]').count()
+
+        for index, item in enumerate(items):
+            opened = await self._open_resume_editor(
+                page,
+                "工作/实习经历",
+                item_text=self._normalize_text(item.get("company") or ""),
+                edit_selector=(
+                    f'a.link-edit[ka="user-resume-edit-workexp{index}"]'
+                    if index < existing_count
+                    else ".resume-workExpList a.link-edit"
+                ),
+                add_selector='[ka="user-resume-add-workexp"], .resume-workExpList a.link-add',
+            )
+            if not opened:
+                messages.append(f"BOSS 工作经历第 {index + 1} 条未找到编辑入口，已跳过")
+                continue
+            await page.wait_for_timeout(600)
+            try:
+                result = await page.evaluate(
+                    """async ({ payload }) => {
+                    const container = document.querySelector('.work-experience-container');
+                    const vm = container?.__vue__;
+                    const form = vm?._data?.formData || vm?.formData;
+                    if (!vm || !form) {
+                        return { ok: false, reason: '未找到工作经历表单。' };
+                    }
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const lower = (value) => normalize(value).toLowerCase();
+                    const includesAny = (value, keywords) => keywords.some((keyword) => lower(value).includes(keyword));
+                    const findIndustry = (token) => {
+                        const normalized = lower(token);
+                        for (const group of vm._data?.industryList || []) {
+                            for (const child of group.subLevelModelList || []) {
+                                const name = lower(child?.name || '');
+                                if (!name) continue;
+                                if (name === normalized || name.includes(normalized) || normalized.includes(name)) {
+                                    return child;
+                                }
+                            }
+                        }
+                        return null;
+                    };
+                    const resolvePositionToken = (value) => {
+                        const text = lower(value);
+                        if (!text) return '后端开发';
+                        if (includesAny(text, ['java', '后端', '后台', '服务端', 'golang', 'python', 'php', '全栈', 'full stack', 'fullstack'])) {
+                            return '后端开发';
+                        }
+                        if (includesAny(text, ['前端', 'vue', 'react', 'uniapp', '小程序', '移动端', 'android', 'ios'])) {
+                            return '前端/移动开发';
+                        }
+                        if (includesAny(text, ['测试', 'qa'])) {
+                            return '测试';
+                        }
+                        if (includesAny(text, ['运维', 'devops'])) {
+                            return '运维/技术支持';
+                        }
+                        return normalize(value);
+                    };
+                    const findPosition = (token) => {
+                        const normalized = lower(resolvePositionToken(token));
+                        for (const group of vm._data?.positionList || []) {
+                            for (const child of group.subLevelModelList || []) {
+                                const name = lower(child?.name || '');
+                                if (!name) continue;
+                                if (name === normalized || name.includes(normalized) || normalized.includes(name)) {
+                                    return { parent: group, child };
+                                }
+                            }
+                        }
+                        return null;
+                    };
+
+                    const position = findPosition(payload?.title || payload?.role || '');
+                    const industry = findIndustry(payload?.industry || '计算机软件');
+                    if (industry) {
+                        form.industryCode = industry.code || industry.id || industry.value || '';
+                        form.industryName = industry.name || payload?.industry || '计算机软件';
+                    } else {
+                        form.industryCode = '';
+                        form.industryName = normalize(payload?.industry || '计算机软件');
+                    }
+
+                    form.companyName = normalize(payload?.company || '');
+                    form.department = normalize(payload?.department || '');
+                    form.startDate = normalize(payload?.start_date || '');
+                    form.endDate = normalize(payload?.end_date || '');
+                    form.workContent = normalize(payload?.work_content || payload?.description || '');
+                    form.workPerformance = normalize(payload?.work_performance || '');
+                    form.workType = !!payload?.is_intern;
+                    form.isPublic = true;
+                    form.emphasis = Array.isArray(payload?.tags) ? payload.tags.slice(0, 6).map((item) => normalize(item)).filter(Boolean) : [];
+
+                    if (position?.child) {
+                        vm._data.positionName = position.child.name || resolvePositionToken(payload?.title || '');
+                        vm._data.positionCode = position.child.code || position.child.id || position.child.value || 0;
+                        vm._data.positionLv2 = position.parent?.code || position.parent?.id || position.parent?.value || 0;
+                        form.position = vm._data.positionCode || 0;
+                        form.positionName = vm._data.positionName || '';
+                        form.customPositionName = vm._data.positionName || '';
+                    } else {
+                        const fallbackName = resolvePositionToken(payload?.title || payload?.role || '');
+                        vm._data.positionName = fallbackName;
+                        form.position = 0;
+                        form.positionName = fallbackName;
+                        form.customPositionName = fallbackName;
+                    }
+
+                    await vm.handleSubmit();
+                    await new Promise((resolve) => setTimeout(resolve, 700));
+                    return {
+                        ok: true,
+                        positionMatched: !!position?.child,
+                        industryMatched: !!industry,
+                    };
+                }""",
+                    {"payload": item},
+                )
+            except Exception:
+                messages.append(f"BOSS 工作经历第 {index + 1} 条未能打开编辑表单，已跳过")
+                continue
+            await self._confirm_resume_risk_dialog(page)
+            await page.wait_for_timeout(1000)
+            saved = await self._wait_editor_closed(page, "编辑工作/实习经历")
+            if not saved:
+                saved = await self._finish_resume_editor(page, "编辑工作/实习经历")
+            if not saved:
+                messages.append(f"BOSS 工作经历第 {index + 1} 条保存失败，已保留原值")
+                await self._dismiss_unsaved_resume_editor(page)
+                continue
+            updated_count += 1
+            if not result.get("positionMatched"):
+                messages.append(f"BOSS 工作经历第 {index + 1} 条职位未精确匹配，已使用近似职位")
+            if not result.get("industryMatched"):
+                messages.append(f"BOSS 工作经历第 {index + 1} 条所属行业未精确匹配，已尝试默认行业")
+
+        return {"updated": updated_count > 0, "messages": messages}
+
+    async def _sync_resume_project_experiences(self, page, items: list[dict]) -> dict:
+        if not items:
+            return {"updated": False, "messages": []}
+
+        updated_count = 0
+        messages: list[str] = []
+        existing_count = await page.locator('a.link-edit[ka^="user-resume-edit-project"]').count()
+
+        for index, item in enumerate(items):
+            opened = await self._open_resume_editor(
+                page,
+                "项目经历",
+                item_text=self._normalize_text(item.get("name") or ""),
+                edit_selector=(
+                    f'a.link-edit[ka="user-resume-edit-project{index}"]'
+                    if index < existing_count
+                    else ".resume-project a.link-edit"
+                ),
+                add_selector='[ka="user-resume-add-project"], .resume-project a.link-add',
+            )
+            if not opened:
+                messages.append(f"BOSS 项目经历第 {index + 1} 条未找到编辑入口，已跳过")
+                continue
+            await page.wait_for_timeout(600)
+            try:
+                await page.evaluate(
+                    """async ({ payload }) => {
+                    const container = document.querySelector('.resume-project .item-form');
+                    const vm = container?.__vue__;
+                    const form = vm?._data?.formData || vm?.formData;
+                    if (!vm || !form) {
+                        throw new Error('未找到项目经历表单。');
+                    }
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    form.name = normalize(payload?.name || '');
+                    form.roleName = normalize(payload?.role || payload?.title || '');
+                    form.url = normalize(payload?.url || '');
+                    form.startDate = normalize(payload?.start_date || '');
+                    form.endDate = normalize(payload?.end_date || '');
+                    form.description = normalize(payload?.description || '');
+                    form.performance = normalize(payload?.performance || '');
+                    await vm.handleSubmit();
+                    await new Promise((resolve) => setTimeout(resolve, 700));
+                    return { ok: true };
+                }""",
+                    {"payload": item},
+                )
+            except Exception:
+                messages.append(f"BOSS 项目经历第 {index + 1} 条未能打开编辑表单，已跳过")
+                continue
+            await self._confirm_resume_risk_dialog(page)
+            await page.wait_for_timeout(1000)
+            if not await self._wait_editor_closed(page, "编辑项目经历"):
+                messages.append(f"BOSS 项目经历第 {index + 1} 条保存失败，已保留原值")
+                await self._dismiss_unsaved_resume_editor(page)
+                continue
+            updated_count += 1
+
+        return {"updated": updated_count > 0, "messages": messages}
+
+    async def _sync_resume_education_experiences(self, page, items: list[dict]) -> dict:
+        if not items:
+            return {"updated": False, "messages": []}
+
+        updated_count = 0
+        messages: list[str] = []
+        existing_count = await page.locator('a.link-edit[ka^="user-resume-edit-eduexp"]').count()
+
+        for index, item in enumerate(items):
+            opened = await self._open_resume_editor(
+                page,
+                "教育经历",
+                item_text=self._normalize_text(item.get("school") or ""),
+                edit_selector=(
+                    f'a.link-edit[ka="user-resume-edit-eduexp{index}"]'
+                    if index < existing_count
+                    else ".resume-education a.link-edit"
+                ),
+                add_selector='[ka="user-resume-add-eduexp"], .resume-education a.link-add',
+            )
+            if not opened:
+                messages.append(f"BOSS 教育经历第 {index + 1} 条未找到编辑入口，已跳过")
+                continue
+            await page.wait_for_timeout(600)
+            try:
+                await page.evaluate(
+                    """async ({ payload }) => {
+                    const container = document.querySelector('.resume-education .item-form');
+                    const vm = container?.__vue__;
+                    const form = vm?._data?.formData || vm?.formData;
+                    if (!vm || !form) {
+                        throw new Error('未找到教育经历表单。');
+                    }
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    form.school = normalize(payload?.school || '');
+                    form.degree = String(payload?.degree_code || form.degree || '');
+                    form.major = normalize(payload?.major || '');
+                    form.startDate = normalize(payload?.start_year || '');
+                    form.endDate = normalize(payload?.end_year || '');
+                    form.eduDescription = normalize(payload?.edu_description || '');
+                    form.thesisTitle = normalize(payload?.thesis_title || '');
+                    form.thesisDesc = normalize(payload?.thesis_desc || '');
+                    form.course = Array.isArray(payload?.course) ? payload.course.slice(0, 5).map((item) => normalize(item)).filter(Boolean) : [];
+                    await vm.handleSubmit();
+                    await new Promise((resolve) => setTimeout(resolve, 700));
+                    return { ok: true };
+                }""",
+                    {"payload": item},
+                )
+            except Exception:
+                messages.append(f"BOSS 教育经历第 {index + 1} 条未能打开编辑表单，已跳过")
+                continue
+            await self._confirm_resume_risk_dialog(page)
+            await page.wait_for_timeout(1200)
+            saved = await self._wait_editor_closed(page, "编辑教育经历")
+            if not saved:
+                saved = await self._finish_resume_editor(page, "编辑教育经历")
+            if not saved:
+                messages.append(f"BOSS 教育经历第 {index + 1} 条保存失败，已保留原值")
+                await self._dismiss_unsaved_resume_editor(page)
+                continue
+            updated_count += 1
+
+        return {"updated": updated_count > 0, "messages": messages}
+
+    async def _sync_resume_certificates(self, page, certificates: list[str]) -> dict:
+        targets = [item for item in certificates if str(item or "").strip()]
+        if not targets:
+            return {"updated": False, "messages": []}
+
+        visible_text = await page.evaluate(
+            "() => (document.body?.innerText || '').replace(/\\s+/g, ' ').trim()"
+        )
+        pending = [item for item in targets if item not in visible_text]
+        if not pending:
+            return {"updated": False, "messages": []}
+
+        opened = await self._open_resume_editor(
+            page,
+            "资格证书",
+            add_selector='[ka="custom_add_btn_certificationList"], .resume-certification a.link-add',
+        )
+        if not opened:
+            return {"updated": False, "messages": ["BOSS 资格证书编辑入口未找到，已跳过"]}
+        await page.wait_for_timeout(700)
+        result = await page.evaluate(
+            """async ({ certificates }) => {
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                const clickIncludes = (selector, keyword) => {
+                    const nodes = Array.from(document.querySelectorAll(selector));
+                    const node = nodes.find((el) => normalize(el.innerText || el.textContent || '').includes(keyword) && el.offsetParent !== null);
+                    if (!node) return false;
+                    node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    return true;
+                };
+
+                let selected = 0;
+                for (const item of certificates || []) {
+                    if (clickIncludes('.certification-dialog label.checkbox', normalize(item))) {
+                        selected += 1;
+                        await new Promise((resolve) => setTimeout(resolve, 120));
+                    }
+                }
+                clickIncludes('.certification-dialog button, .certification-dialog .btn', '确定');
+                await new Promise((resolve) => setTimeout(resolve, 700));
+                return { selected };
+            }""",
+            {"certificates": pending},
+        )
+        await page.wait_for_timeout(600)
+        messages: list[str] = []
+        selected = int(result.get("selected") or 0)
+        if selected < len(pending):
+            messages.append("BOSS 部分资格证书未命中可选项，已跳过")
+        return {"updated": selected > 0, "messages": messages}
+
+    async def _sync_resume_skills(self, page, skills: list[str]) -> dict:
+        normalized_skills = [self._normalize_text(item) for item in skills if self._normalize_text(item)]
+        if not normalized_skills:
+            return {"updated": False, "messages": []}
+
+        opened = await self._open_resume_editor(
+            page,
+            "专业技能",
+            edit_selector='a.link-edit[ka="user-resume-edit-professional-skill"], .resume-professionalSkill a.link-edit, .resume-professional-skill a.link-edit',
+            add_selector=".custom-add-item, .catalogue-item",
+        )
+        if not opened:
+            return {"updated": False, "messages": ["BOSS 专业技能入口未找到，已跳过"]}
+        skill_text = "；".join(normalized_skills[:20])[:1000]
+        try:
+            result = await page.evaluate(
+                """({ skillText }) => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const root = Array.from(document.querySelectorAll('*')).find((el) => {
+                        const title = el.querySelector('h3');
+                        return title && ['添加专业技能', '编辑专业技能'].includes(normalize(title.textContent));
+                    });
+                    const textarea = root?.querySelector('textarea');
+                    const title = normalize(root?.querySelector('h3')?.textContent || '');
+                    if (!textarea) return { ok: false, title };
+                    textarea.focus();
+                    textarea.value = skillText;
+                    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                    textarea.dispatchEvent(new Event('change', { bubbles: true }));
+                    return { ok: true, title };
+                }""",
+                {"skillText": skill_text},
+            )
+        except Exception:
+            await self._dismiss_unsaved_resume_editor(page)
+            return {"updated": False, "messages": ["BOSS 专业技能写入失败，已跳过"]}
+        title = str(result.get("title") or "添加专业技能")
+        if not result.get("ok"):
+            await self._dismiss_unsaved_resume_editor(page)
+            return {"updated": False, "messages": ["BOSS 专业技能表单未成功打开，已跳过"]}
+        saved = await self._finish_resume_editor(page, title)
+        if not saved:
+            return {"updated": False, "messages": ["BOSS 专业技能保存失败，已保留原值"]}
+        return {"updated": True, "messages": []}
+
+    async def _click_visible_selector(self, page, selector: str) -> bool:
+        return bool(
+            await page.evaluate(
+                """(selector) => {
+                    const node = Array.from(document.querySelectorAll(selector)).find((el) => el.offsetParent !== null);
+                    if (!node) return false;
+                    node.scrollIntoView({ block: 'center', inline: 'center' });
+                    if (typeof node.click === 'function') {
+                        node.click();
+                    } else {
+                        node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    }
+                    return true;
+                }""",
+                selector,
+            )
+        )
+
+    async def _wait_resume_ready(self, page) -> None:
+        with contextlib.suppress(Exception):
+            await page.wait_for_function(
+                """() => {
+                    const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+                    return text.includes('我的在线简历') && text.includes('个人优势') && text.includes('期望职位');
+                }""",
+                timeout=12000,
+            )
+        await page.wait_for_timeout(500)
+
+    async def _open_resume_editor(
+        self,
+        page,
+        section_name: str,
+        *,
+        item_text: str = "",
+        edit_selector: str = "",
+        add_selector: str = "",
+    ) -> bool:
+        await self._dismiss_unsaved_resume_editor(page)
+        return bool(
+            await page.evaluate(
+                """({ sectionName, itemText, editSelector, addSelector }) => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const clickNode = (node) => {
+                        if (!node) return false;
+                        if (node.offsetParent !== null && typeof node.scrollIntoView === 'function') {
+                            node.scrollIntoView({ block: 'center', inline: 'center' });
+                        }
+                        node.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                        node.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                        if (typeof node.click === 'function') {
+                            node.click();
+                        } else {
+                            node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                        }
+                        return true;
+                    };
+                    const visibleNode = (selector) => {
+                        if (!selector) return null;
+                        return Array.from(document.querySelectorAll(selector)).find((el) => el.offsetParent !== null) || null;
+                    };
+                    const anyNode = (selector) => {
+                        if (!selector) return null;
+                        return document.querySelector(selector);
+                    };
+                    const findSectionRoot = (name) =>
+                        Array.from(document.querySelectorAll('.resume-item, .custom-add-item, .catalogue-item')).find((el) => {
+                            const text = normalize(el.textContent || '');
+                            return text && (text.startsWith(name) || text.includes(name));
+                        }) || null;
+                    if (itemText) {
+                        const item = Array.from(document.querySelectorAll('li, .expect-list-item, .custom-add-item, .resume-item')).find((el) => {
+                            const text = normalize(el.textContent || '');
+                            return text && text.includes(itemText);
+                        });
+                        const itemEdit = item?.querySelector('a.link-edit, .link-edit');
+                        if (clickNode(itemEdit)) return true;
+                        if (clickNode(item)) return true;
+                    }
+                    if (clickNode(visibleNode(editSelector))) return true;
+                    if (clickNode(anyNode(editSelector))) return true;
+                    const sectionRoot = findSectionRoot(sectionName);
+                    const sectionEdit = sectionRoot?.querySelector('a.link-edit, .link-edit');
+                    if (clickNode(sectionEdit)) return true;
+                    if (sectionName === '专业技能') {
+                        const skillCard = Array.from(document.querySelectorAll('.resume-professionalSkill, .resume-professional-skill, .custom-add-item, .catalogue-item, span')).find((el) => {
+                            const text = normalize(el.textContent || '');
+                            return text === '专业技能突出专业技能、特长展示' || text === '专业技能 突出专业技能、特长展示' || text.includes('专业技能');
+                        });
+                        const skillTarget = skillCard?.closest?.('.resume-professionalSkill, .resume-professional-skill, .custom-add-item, .catalogue-item') || skillCard;
+                        if (clickNode(skillTarget)) return true;
+                    }
+                    if (clickNode(visibleNode(addSelector))) return true;
+                    if (clickNode(anyNode(addSelector))) return true;
+                    const addLink = Array.from(document.querySelectorAll('a.link-add, .link-add')).find((el) => {
+                        const root = el.closest('.resume-item');
+                        return normalize(root?.textContent || '').startsWith(sectionName);
+                    });
+                    return clickNode(addLink);
+                }""",
+                {
+                    "sectionName": section_name,
+                    "itemText": self._normalize_text(item_text),
+                    "editSelector": edit_selector,
+                    "addSelector": add_selector,
+                },
+            )
+        )
+
+    async def _dismiss_unsaved_resume_editor(self, page) -> bool:
+        dismissed = bool(
+            await page.evaluate(
+                """() => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const dialog = Array.from(document.querySelectorAll('*')).find((el) => normalize(el.textContent).includes('有内容没有保存，确定退出编辑吗？'));
+                    if (!dialog) return false;
+                    const confirm = Array.from(document.querySelectorAll('button, span, a')).find((el) => el.offsetParent !== null && normalize(el.textContent) === '确定');
+                    if (!confirm) return false;
+                    if (typeof confirm.click === 'function') {
+                        confirm.click();
+                    } else {
+                        confirm.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    }
+                    return true;
+                }"""
+            )
+        )
+        if dismissed:
+            await page.wait_for_timeout(600)
+        return dismissed
+
+    async def _has_resume_error_dialog(self, page) -> bool:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const isVisible = (node) => !!node && node.offsetParent !== null;
+                    return Array.from(document.querySelectorAll('*')).some((el) => {
+                        if (!isVisible(el)) return false;
+                        const text = normalize(el.textContent || '');
+                        if (!text) return false;
+                        return text.includes('提交失败') || text.includes('请填写正确的薪资');
+                    });
+                }"""
+            )
+        )
+
+    async def _finish_resume_editor(self, page, title: str) -> bool:
+        clicked = bool(
+            await page.evaluate(
+                """({ title }) => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const root = Array.from(document.querySelectorAll('*')).find((el) => {
+                        const h3 = el.querySelector('h3');
+                        return h3 && normalize(h3.textContent) === title;
+                    });
+                    const button = Array.from(root?.querySelectorAll('button') || []).find((el) => normalize(el.textContent).includes('完成') && !el.disabled);
+                    if (!button) return false;
+                    button.click();
+                    return true;
+                }""",
+                {"title": title},
+            )
+        )
+        if not clicked:
+            return False
+        await self._confirm_resume_risk_dialog(page)
+        await self._confirm_resume_modify_dialog(page)
+        await page.wait_for_timeout(1200)
+        if await self._has_resume_error_dialog(page):
+            return False
+        return await self._wait_editor_closed(page, title)
+
+    async def _wait_editor_closed(self, page, title: str) -> bool:
+        for _ in range(10):
+            is_open = bool(
+                await page.evaluate(
+                    """({ title }) => {
+                        const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                        return Array.from(document.querySelectorAll('h3')).some((el) => {
+                            if (el.offsetParent === null) return false;
+                            return normalize(el.textContent) === title;
+                        });
+                    }""",
+                    {"title": title},
+                )
+            )
+            if not is_open:
+                return True
+            await page.wait_for_timeout(500)
+        return False
+
+    async def _confirm_resume_risk_dialog(self, page) -> bool:
+        confirmed = bool(
+            await page.evaluate(
+                """() => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const nodes = Array.from(document.querySelectorAll('.risk-dialog .btn.btn-primary, .risk-dialog .btn-sure, .risk-dialog .btn-primary, .risk-dialog button, .risk-dialog span, button, span'));
+                    const node = nodes.find((el) => {
+                        if (el.offsetParent === null) return false;
+                        const text = normalize(el.textContent);
+                        return text === '确认提交' || text === '确定';
+                    });
+                    if (!node) return false;
+                    if (typeof node.click === 'function') {
+                        node.click();
+                    } else {
+                        node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    }
+                    return true;
+                }"""
+            )
+        )
+        if confirmed:
+            await page.wait_for_timeout(1200)
+        return confirmed
+
+    async def _confirm_resume_modify_dialog(self, page) -> bool:
+        confirmed = bool(
+            await page.evaluate(
+                """() => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const isVisible = (node) => !!node && node.offsetParent !== null;
+                    const dialog = Array.from(document.querySelectorAll('*')).find((el) => {
+                        if (!isVisible(el)) return false;
+                        const text = normalize(el.textContent || '');
+                        return text.includes('确认修改') || text.includes('确定要修改吗');
+                    });
+                    if (!dialog) return false;
+                    const confirm = Array.from(dialog.querySelectorAll('button, span, a')).find((el) => {
+                        if (!isVisible(el)) return false;
+                        return normalize(el.textContent) === '确定';
+                    });
+                    if (!confirm) return false;
+                    if (typeof confirm.click === 'function') {
+                        confirm.click();
+                    } else {
+                        confirm.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    }
+                    return true;
+                }"""
+            )
+        )
+        if confirmed:
+            await page.wait_for_timeout(1200)
+        return confirmed
+
+    async def _reload_resume_page(self, page, target_url: str) -> None:
+        with contextlib.suppress(Exception):
+            await page.goto(target_url, wait_until="domcontentloaded")
+            await self._wait_resume_ready(page)
+
+    async def _import_resume_snapshot(
+        self,
+        profile_dir: str,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://www.zhipin.com/web/geek/resume",
+    ) -> dict:
+        from playwright.async_api import async_playwright
+
+        launch_headless = settings.browser_headless if headless is None else headless
+        use_persistent_context = bool(launch_headless and not settings.browser_fake_headless)
+
+        async with async_playwright() as playwright:
+            browser = None
+            chrome_pid: int | None = None
+            if use_persistent_context:
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **build_browser_launch_options(launch_headless),
+                )
+            else:
+                chrome_path = self._resolve_chrome_executable()
+                profile_path = Path(profile_dir)
+                if not profile_path.is_absolute():
+                    profile_path = Path.cwd() / profile_path
+                profile_path.mkdir(parents=True, exist_ok=True)
+
+                debug_port = self._pick_free_port()
+                chrome_pid = self._launch_external_chrome(
+                    chrome_path,
+                    profile_path,
+                    debug_port,
+                    target_url,
+                    launch_options=build_browser_launch_options(launch_headless),
+                )
+                ws_endpoint = self._wait_for_cdp_endpoint(debug_port, timeout=20, should_stop=lambda: False)
+                if not ws_endpoint:
+                    raise RuntimeError("BOSS 简历浏览器已启动，但未能连接到调试端口。")
+                browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
+            await context.add_init_script(LAODENG_INIT_SCRIPT)
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_function(
+                        """() => {
+                            const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+                            return text.includes('我的在线简历') || text.includes('个人优势') || text.includes('期望职位');
+                        }""",
+                        timeout=12000,
+                    )
+                with contextlib.suppress(Exception):
+                    await page.wait_for_timeout(800)
+                current_url = (page.url or "").lower()
+                if "login" in current_url or "passport" in current_url:
+                    raise RuntimeError("BOSS 当前未登录，请先在账号配置浏览器中完成登录后再导入。")
+                lines = await page.evaluate(
+                    "() => document.body.innerText.split('\\n').map(line => line.trim()).filter(Boolean)"
+                )
+                return self._parse_resume_lines(lines, page.url)
+            finally:
+                with contextlib.suppress(Exception):
+                    await context.close()
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        await browser.close()
+                self._terminate_chrome_process(chrome_pid)
+
+    @staticmethod
+    def _parse_resume_lines(lines: list[str], source_url: str) -> dict:
+        normalized_lines = [re.sub(r"\s+", " ", str(line or "")).strip() for line in lines if str(line or "").strip()]
+
+        def find_index(candidates: list[str], start_at: int = 0) -> int | None:
+            for idx in range(start_at, len(normalized_lines)):
+                if normalized_lines[idx] in candidates:
+                    return idx
+            return None
+
+        def section_slice(names: list[str], next_names: list[str]) -> list[str]:
+            start_idx = find_index(names, content_start)
+            if start_idx is None:
+                return []
+            start = start_idx + 1
+            end = len(normalized_lines)
+            for next_name in next_names:
+                next_idx = find_index([next_name], start)
+                if next_idx is not None:
+                    end = min(end, next_idx)
+            return normalized_lines[start:end]
+
+        def is_date_line(value: str) -> bool:
+            return bool(re.search(r"\d{4}[./-]\d{1,2}\s*-\s*(?:\d{4}[./-]\d{1,2}|至今)", value))
+
+        def is_contact_line(value: str) -> bool:
+            return bool(
+                re.search(r"\d{3,}\*+\d+|@|[A-Za-z]{2,}\*+[A-Za-z0-9]*|微信|邮箱|电话", value)
+            )
+
+        name = ""
+        contact_summary = ""
+        headline = ""
+        profile_anchor = find_index(["我的在线简历"])
+        content_start = profile_anchor or 0
+        if profile_anchor is not None:
+            skip_tokens = {
+                "新头像正在审核中",
+                "预览",
+                "导入已有简历",
+                "导出为附件简历",
+                "简历专业评分",
+                "个人优势",
+                "期望职位",
+                "工作经历",
+                "工作/实习经历",
+                "项目经历",
+                "教育经历",
+                "资格证书",
+                "附件管理",
+            }
+            head_candidates = normalized_lines[profile_anchor + 1 : profile_anchor + 18]
+            summary_mode = False
+            profile_tokens: list[str] = []
+            for token in head_candidates:
+                if token == "简历专业评分":
+                    summary_mode = True
+                    continue
+                if summary_mode and (token.endswith("分") or "待优化项" in token):
+                    continue
+                if token in skip_tokens:
+                    continue
+                profile_tokens.append(token)
+
+            if profile_tokens:
+                name = profile_tokens[0]
+                headline_tokens: list[str] = []
+                contact_tokens: list[str] = []
+                for token in profile_tokens[1:]:
+                    if is_contact_line(token):
+                        contact_tokens.append(token)
+                    elif not contact_tokens:
+                        headline_tokens.append(token)
+                headline = " / ".join(headline_tokens[:2]).strip()
+                contact_summary = " ".join(contact_tokens[:3]).strip()
+
+        if not name:
+            for idx, value in enumerate(normalized_lines):
+                if value == "我的在线简历" and idx + 3 < len(normalized_lines):
+                    name = normalized_lines[idx + 1]
+                    break
+
+        summary_lines = section_slice(["个人优势"], ["期望职位"])
+        preference_lines = section_slice(["期望职位"], ["工作经历", "工作/实习经历"])
+        work_lines = section_slice(["工作经历", "工作/实习经历"], ["项目经历"])
+        project_lines = section_slice(["项目经历"], ["教育经历"])
+        education_lines = section_slice(["教育经历"], ["资格证书", "自定义添加"])
+        certificate_lines = section_slice(["资格证书"], ["社团/组织经历", "自定义添加", "附件管理"])
+        attachment_lines = section_slice(["附件管理"], ["隐私设置", "道具"])
+
+        preference_items = [item for item in preference_lines if item and item not in {"全职职位", "兼职职位", "实习职位"}]
+        job_type = ""
+        with contextlib.suppress(IndexError):
+            if preference_lines and preference_lines[0].endswith("职位"):
+                job_type = preference_lines[0]
+            elif preference_lines:
+                job_type = preference_lines[0]
+
+        preferred_roles: list[str] = []
+        preferred_salary = ""
+        preferred_locations = ""
+        for item in preference_items:
+            match = re.match(r"^(.*?)(\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?[KkWw])(.+)$", item)
+            if match:
+                role = match.group(1).strip()
+                salary = match.group(2).strip().upper()
+                location = match.group(3).strip()
+                if role:
+                    preferred_roles.append(role)
+                if not preferred_salary:
+                    preferred_salary = salary
+                if location and location not in preferred_locations:
+                    preferred_locations = f"{preferred_locations}，{location}".strip("，")
+            elif item not in preferred_roles:
+                preferred_roles.append(item)
+
+        wechat_id = ""
+        wechat_match = re.search(r"([A-Za-z]{2,}\*+[A-Za-z0-9]*)", contact_summary)
+        if wechat_match:
+            wechat_id = wechat_match.group(1)
+
+        job_preferences = {
+            "job_type": job_type,
+            "desired_role": " / ".join(preferred_roles),
+            "salary": preferred_salary,
+            "locations": preferred_locations,
+            "raw_tokens": preference_lines,
+        }
+
+        work_experiences: list[dict] = []
+        idx = 0
+        while idx < len(work_lines):
+            if idx + 3 >= len(work_lines):
+                break
+            company = work_lines[idx]
+            title = work_lines[idx + 1]
+            employment_type = work_lines[idx + 2]
+            date_range = work_lines[idx + 3] if idx + 3 < len(work_lines) else ""
+            if not is_date_line(date_range):
+                idx += 1
+                continue
+            idx += 4
+            tags: list[str] = []
+            description_parts: list[str] = []
+            while idx < len(work_lines):
+                current = work_lines[idx]
+                if idx + 3 < len(work_lines) and is_date_line(work_lines[idx + 3]):
+                    break
+                if current in {"内容：", "业绩："}:
+                    idx += 1
+                    continue
+                if len(current) <= 20 and "\n" not in current and "：" not in current and not current.startswith("项目背景"):
+                    tags.append(current)
+                else:
+                    description_parts.append(current)
+                idx += 1
+            work_experiences.append(
+                {
+                    "company": company,
+                    "title": title,
+                    "employment_type": employment_type,
+                    "date_range": date_range,
+                    "tags": tags,
+                    "description": "\n".join(description_parts).strip(),
+                }
+            )
+
+        project_experiences: list[dict] = []
+        idx = 0
+        while idx + 2 < len(project_lines):
+            name_line = project_lines[idx]
+            role = project_lines[idx + 1]
+            date_range = project_lines[idx + 2]
+            if not is_date_line(date_range):
+                idx += 1
+                continue
+            idx += 3
+            description_parts: list[str] = []
+            while idx < len(project_lines):
+                current = project_lines[idx]
+                if idx + 2 < len(project_lines) and is_date_line(project_lines[idx + 2]):
+                    break
+                if current == "内容：":
+                    idx += 1
+                    continue
+                description_parts.append(current)
+                idx += 1
+            project_experiences.append(
+                {
+                    "name": name_line,
+                    "role": role,
+                    "date_range": date_range,
+                    "description": "\n".join(description_parts).strip(),
+                }
+            )
+
+        education_experiences: list[dict] = []
+        if len(education_lines) >= 4:
+            education_experiences.append(
+                {
+                    "school": education_lines[0],
+                    "date_range": education_lines[1],
+                    "major": education_lines[2],
+                    "degree": education_lines[3],
+                    "description": "\n".join(education_lines[4:]).strip() if len(education_lines) > 4 else "",
+                }
+            )
+
+        attachments: list[dict] = []
+        for idx, value in enumerate(attachment_lines):
+            if value.startswith("文件（") or value == "附件简历":
+                continue
+            if value.endswith(".pdf") or value.endswith(".doc") or value.endswith(".docx"):
+                meta = attachment_lines[idx + 1] if idx + 1 < len(attachment_lines) else ""
+                attachments.append({"name": value, "meta": meta})
+
+        return {
+            "source_url": source_url,
+            "full_name": name,
+            "headline": headline,
+            "contact_summary": contact_summary,
+            "wechat_id": wechat_id,
+            "summary": "\n".join(summary_lines).strip(),
+            "job_preferences": job_preferences,
+            "work_experiences": work_experiences,
+            "project_experiences": project_experiences,
+            "education_experiences": education_experiences,
+            "certificates": [
+                item
+                for item in certificate_lines
+                if item and "推荐" not in item and "含金量" not in item and "证明你的专业程度" not in item
+            ],
+            "skills": [],
+            "languages": [],
+            "attachments": attachments,
+            "raw_snapshot": {"lines": normalized_lines},
+        }
+
+    @staticmethod
+    def _split_resume_terms(value: str | None) -> list[str]:
+        if not value:
+            return []
+        raw_items = re.split(r"[/|,，、；;\n]+", str(value))
+        results: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            normalized = re.sub(r"\s+", " ", item).strip()
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(normalized)
+        return results
+
+    @classmethod
+    def _build_resume_sync_payload(cls, master_resume: dict) -> dict:
+        job_preferences = dict(master_resume.get("job_preferences", {}) or {})
+        salary_text = str(job_preferences.get("salary") or "").strip()
+        salary_min, salary_max = cls.normalize_salary(salary_text) if salary_text else (None, None)
+        salary_min_k = int(round(salary_min)) if salary_min is not None else None
+        salary_max_k = int(round(salary_max)) if salary_max is not None else None
+        desired_role = str(job_preferences.get("desired_role") or "").strip()
+        email = cls._extract_resume_email(master_resume)
+        return {
+            "basic_info": {
+                "full_name": str(master_resume.get("full_name") or "").strip(),
+                "wechat_id": str(master_resume.get("wechat_id") or "").strip(),
+                "email": email,
+            },
+            "summary": str(master_resume.get("summary") or "").strip(),
+            "desired_role": desired_role,
+            "roles": cls._split_resume_terms(job_preferences.get("desired_role")),
+            "locations_text": str(job_preferences.get("locations") or "").strip(),
+            "locations": cls._split_resume_terms(job_preferences.get("locations")),
+            "salary_text": salary_text,
+            "salary_min_k": salary_min_k,
+            "salary_max_k": salary_max_k,
+            "work_experiences": [
+                cls._build_work_experience_sync_payload(item, desired_role)
+                for item in (master_resume.get("work_experiences") or [])
+                if isinstance(item, dict)
+            ],
+            "project_experiences": [
+                cls._build_project_experience_sync_payload(item, desired_role)
+                for item in (master_resume.get("project_experiences") or [])
+                if isinstance(item, dict)
+            ],
+            "education_experiences": [
+                cls._build_education_experience_sync_payload(item)
+                for item in (master_resume.get("education_experiences") or [])
+                if isinstance(item, dict)
+            ],
+            "certificates": [str(item).strip() for item in (master_resume.get("certificates") or []) if str(item).strip()],
+            "skills": [str(item).strip() for item in (master_resume.get("skills") or []) if str(item).strip()],
+        }
+
+    @classmethod
+    def _build_work_experience_sync_payload(cls, item: dict, desired_role: str) -> dict:
+        start_date, end_date = cls._parse_date_range(item.get("date_range"), year_only=False)
+        description = str(item.get("description") or "").strip()
+        tags = [str(tag).strip() for tag in (item.get("tags") or []) if str(tag).strip()]
+        title = str(item.get("title") or "").strip()
+        return {
+            "company": str(item.get("company") or "").strip(),
+            "title": title or desired_role,
+            "role": title or desired_role,
+            "department": str(item.get("department") or "").strip(),
+            "industry": str(item.get("industry") or "计算机软件").strip() or "计算机软件",
+            "start_date": start_date,
+            "end_date": end_date,
+            "work_content": description[:3000],
+            "work_performance": cls._summarize_first_lines(description, max_length=900),
+            "tags": tags[:6],
+            "is_intern": "实习" in str(item.get("employment_type") or ""),
+        }
+
+    @classmethod
+    def _build_project_experience_sync_payload(cls, item: dict, desired_role: str) -> dict:
+        start_date, end_date = cls._parse_date_range(item.get("date_range"), year_only=False)
+        description = str(item.get("description") or "").strip()
+        role = str(item.get("role") or "").strip() or str(item.get("title") or "").strip() or desired_role.strip()
+        return {
+            "name": str(item.get("name") or "").strip(),
+            "role": role,
+            "url": str(item.get("url") or "").strip(),
+            "start_date": start_date,
+            "end_date": end_date,
+            "description": description[:3000],
+            "performance": cls._summarize_first_lines(description, max_length=900),
+        }
+
+    @classmethod
+    def _build_education_experience_sync_payload(cls, item: dict) -> dict:
+        start_year, end_year = cls._parse_date_range(item.get("date_range"), year_only=True)
+        description = str(item.get("description") or "").strip()
+        degree_text = str(item.get("degree") or "").strip()
+        return {
+            "school": str(item.get("school") or "").strip(),
+            "major": str(item.get("major") or "").strip(),
+            "degree": degree_text,
+            "degree_code": cls._map_degree_code(degree_text),
+            "start_year": start_year,
+            "end_year": end_year,
+            "edu_description": description[:3000],
+            "thesis_title": str(item.get("thesis_title") or "").strip(),
+            "thesis_desc": str(item.get("thesis_desc") or "").strip()[:600],
+            "course": [str(course).strip() for course in (item.get("course") or []) if str(course).strip()][:5],
+        }
+
+    @staticmethod
+    def _parse_date_range(value: str | None, *, year_only: bool) -> tuple[str, str]:
+        text = str(value or "")
+        parts = re.split(r"\s*-\s*", text)
+        start = BossAdapter._normalize_resume_date(parts[0] if parts else "", year_only=year_only)
+        end = BossAdapter._normalize_resume_date(parts[1] if len(parts) > 1 else "", year_only=year_only)
+        return start, end
+
+    @staticmethod
+    def _normalize_resume_date(value: str, *, year_only: bool) -> str:
+        normalized = str(value or "").strip().replace("/", ".").replace("-", ".")
+        match = re.search(r"(\d{4})(?:\.(\d{1,2}))?", normalized)
+        if not match:
+            return ""
+        year = match.group(1)
+        month = match.group(2)
+        if year_only:
+            return year
+        if not month:
+            return f"{year}-01"
+        return f"{year}-{int(month):02d}"
+
+    @staticmethod
+    def _map_degree_code(value: str) -> str:
+        mapping = {
+            "初中及以下": "209",
+            "中专": "208",
+            "中技": "208",
+            "高中": "206",
+            "大专": "202",
+            "本科": "203",
+            "硕士": "204",
+            "博士": "205",
+        }
+        return mapping.get(str(value or "").strip(), "203")
+
+    @staticmethod
+    def _summarize_first_lines(value: str, *, max_length: int) -> str:
+        lines = [re.sub(r"\s+", " ", line).strip("•\t -") for line in str(value or "").splitlines()]
+        merged = "；".join(line for line in lines if line)
+        return merged[:max_length].strip()
+
+    @staticmethod
+    def _extract_resume_email(master_resume: dict) -> str:
+        candidates = [
+            master_resume.get("email"),
+            master_resume.get("contact_summary"),
+        ]
+        for candidate in candidates:
+            match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", str(candidate or ""))
+            if match:
+                return match.group(0).strip()
+        return ""

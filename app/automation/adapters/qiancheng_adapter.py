@@ -19,6 +19,7 @@ from app.automation.browser_factory import (
     STEALTH_INIT_SCRIPT,
     build_browser_launch_options,
 )
+from app.automation.async_runner import run_async_blocking
 from app.core.config import settings
 from app.services.live_preview_service import live_preview_service
 
@@ -1551,3 +1552,542 @@ class QianchengAdapter:
                 break
             per_job_callback(sample)
             asyncio.run(asyncio.sleep(1.2))
+
+    def import_resume_snapshot(
+        self,
+        profile_dir: str,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://www.51job.com/resume/center?lang=c",
+    ) -> dict:
+        return run_async_blocking(self._import_resume_snapshot(profile_dir, headless=headless, target_url=target_url))
+
+    def sync_master_resume(
+        self,
+        profile_dir: str,
+        master_resume: dict,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://www.51job.com/resume/center?lang=c",
+    ) -> dict:
+        return run_async_blocking(
+            self._sync_master_resume(
+                profile_dir,
+                master_resume,
+                headless=headless,
+                target_url=target_url,
+            )
+        )
+
+    async def _import_resume_snapshot(
+        self,
+        profile_dir: str,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://www.51job.com/resume/center?lang=c",
+    ) -> dict:
+        from playwright.async_api import async_playwright
+
+        launch_headless = settings.browser_headless if headless is None else headless
+        use_persistent_context = bool(launch_headless and not settings.browser_fake_headless)
+
+        async with async_playwright() as playwright:
+            browser = None
+            chrome_pid: int | None = None
+            if use_persistent_context:
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **build_browser_launch_options(launch_headless),
+                )
+            else:
+                chrome_path = self._resolve_chrome_executable()
+                profile_path = Path(profile_dir)
+                if not profile_path.is_absolute():
+                    profile_path = Path.cwd() / profile_path
+                profile_path.mkdir(parents=True, exist_ok=True)
+
+                debug_port = self._pick_free_port()
+                chrome_pid = self._launch_external_chrome(
+                    chrome_path,
+                    profile_path,
+                    debug_port,
+                    target_url,
+                    launch_options=build_browser_launch_options(launch_headless),
+                )
+                ws_endpoint = self._wait_for_cdp_endpoint(debug_port, timeout=20, should_stop=lambda: False)
+                if not ws_endpoint:
+                    raise RuntimeError("前程无忧简历浏览器已启动，但未能连接到调试端口。")
+                browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
+            await context.add_init_script(LAODENG_INIT_SCRIPT)
+            page = context.pages[0] if context.pages else await context.new_page()
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_timeout(1200)
+                if await self.is_login_required(page):
+                    raise RuntimeError("前程无忧当前未登录，请先在账号配置浏览器中完成登录后再导入。")
+                lines = await page.evaluate(
+                    "() => document.body.innerText.split('\\n').map(line => line.trim()).filter(Boolean)"
+                )
+                return self._parse_resume_lines(lines, page.url)
+            finally:
+                with contextlib.suppress(Exception):
+                    await context.close()
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        await browser.close()
+                self._terminate_chrome_process(chrome_pid)
+
+    async def _sync_master_resume(
+        self,
+        profile_dir: str,
+        master_resume: dict,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://www.51job.com/resume/center?lang=c",
+    ) -> dict:
+        from playwright.async_api import async_playwright
+
+        launch_headless = settings.browser_headless if headless is None else headless
+        use_persistent_context = bool(launch_headless and not settings.browser_fake_headless)
+
+        async with async_playwright() as playwright:
+            browser = None
+            chrome_pid: int | None = None
+            if use_persistent_context:
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **build_browser_launch_options(launch_headless),
+                )
+            else:
+                chrome_path = self._resolve_chrome_executable()
+                profile_path = Path(profile_dir)
+                if not profile_path.is_absolute():
+                    profile_path = Path.cwd() / profile_path
+                profile_path.mkdir(parents=True, exist_ok=True)
+
+                debug_port = self._pick_free_port()
+                chrome_pid = self._launch_external_chrome(
+                    chrome_path,
+                    profile_path,
+                    debug_port,
+                    target_url,
+                    launch_options=build_browser_launch_options(launch_headless),
+                )
+                ws_endpoint = self._wait_for_cdp_endpoint(debug_port, timeout=20, should_stop=lambda: False)
+                if not ws_endpoint:
+                    raise RuntimeError("前程无忧简历同步浏览器已启动，但未能连接到调试端口。")
+                browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
+            await context.add_init_script(LAODENG_INIT_SCRIPT)
+            page = context.pages[0] if context.pages else await context.new_page()
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_timeout(1200)
+                if await self.is_login_required(page):
+                    raise RuntimeError("前程无忧当前未登录，请先在账号配置浏览器中完成登录后再同步。")
+
+                sync_result = await page.evaluate(
+                    """async ({ masterResume }) => {
+                        const api = window.$nuxt?.$api?.resumeApi;
+                        if (!api) {
+                            throw new Error('前程无忧页面接口未加载完成。');
+                        }
+
+                        const normalize = (value) => String(value || '').trim().toLowerCase();
+                        const normalizeSpace = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                        const unique = (items) => {
+                            const result = [];
+                            const seen = new Set();
+                            for (const item of items || []) {
+                                const normalized = normalizeSpace(item);
+                                if (!normalized) continue;
+                                const key = normalized.toLowerCase();
+                                if (seen.has(key)) continue;
+                                seen.add(key);
+                                result.push(normalized);
+                            }
+                            return result;
+                        };
+                        const splitLocations = (value) => unique(
+                            String(value || '')
+                                .split(/[,+，\\/\\s]+/)
+                                .map((item) => item.trim())
+                                .filter(Boolean)
+                        );
+                        const flattenFunctionItems = (items, collector = []) => {
+                            for (const item of items || []) {
+                                collector.push(item);
+                                if (Array.isArray(item.items) && item.items.length) {
+                                    flattenFunctionItems(item.items, collector);
+                                }
+                            }
+                            return collector;
+                        };
+                        const collectAreaItems = (groups) => {
+                            const result = [];
+                            for (const group of groups || []) {
+                                for (const item of group.items || []) {
+                                    result.push(item);
+                                }
+                            }
+                            return result;
+                        };
+                        const salaryText = normalizeSpace(masterResume?.job_preferences?.salary || '');
+                        const salaryMonthMatch = salaryText.match(/(\\d+)\\s*(?:个?月|薪)/);
+                        const salaryMonth = salaryMonthMatch ? Number(salaryMonthMatch[1]) : null;
+                        const parseSalaryPart = (value) => {
+                            const match = String(value || '').match(/\\d+(?:\\.\\d+)?/);
+                            if (!match) return null;
+                            const num = Number(match[0]);
+                            if (/[万wW]/.test(value || '')) return Math.round(num * 10000);
+                            if (/[千kK]/.test(value || '')) return Math.round(num * 1000);
+                            return num > 1000 ? Math.round(num) : Math.round(num * 1000);
+                        };
+                        const parseSalaryRange = (value) => {
+                            if (!value) return { min: null, max: null };
+                            const cleaned = String(value).split('·')[0].replace(/×/g, '').trim();
+                            const parts = cleaned.split('-').map((item) => item.trim()).filter(Boolean);
+                            if (!parts.length) return { min: null, max: null };
+                            if (parts.length === 1) {
+                                const single = parseSalaryPart(parts[0]);
+                                return { min: single, max: single };
+                            }
+                            let [left, right] = parts;
+                            const rightUnit = right.match(/[万wW千kK]/)?.[0] || '';
+                            const leftUnit = left.match(/[万wW千kK]/)?.[0] || '';
+                            if (!leftUnit && rightUnit) left += rightUnit;
+                            if (!right.match(/[万wW千kK]/) && leftUnit) right += leftUnit;
+                            return { min: parseSalaryPart(left), max: parseSalaryPart(right) };
+                        };
+
+                        const resumeResp = await api.resumesListNew({ isEnglish: false, useStudentIntentionSort: true });
+                        const resumeItem = resumeResp?.resultbody?.items?.[0];
+                        if (!resumeItem?.resumeId) {
+                            throw new Error('未能读取前程无忧简历标识。');
+                        }
+
+                        const messages = [];
+                        const summary = normalizeSpace(masterResume?.summary || '');
+                        if (summary) {
+                            try {
+                                await api.editSelfIntroduction(
+                                    resumeItem.resumeId,
+                                    { selfIntroduction: summary, isEnglish: false }
+                                );
+                                messages.push('个人优势已同步');
+                            } catch (error) {
+                                messages.push('个人优势跳过');
+                            }
+                        } else {
+                            messages.push('个人优势跳过');
+                        }
+
+                        const currentIntention = resumeItem.intentions?.[0];
+                        if (currentIntention?.id) {
+                            const jobPreferences = masterResume?.job_preferences || {};
+                            let expectFunction = currentIntention.expectFunction || '';
+                            let expectFunctionName = currentIntention.expectFunctionName || '';
+                            let functionUpdated = false;
+                            const desiredRole = normalizeSpace(jobPreferences.desired_role || '');
+                            if (desiredRole) {
+                                try {
+                                    const assocResp = await api.getAssociateFuntype({
+                                        keyword: desiredRole,
+                                        isEnglish: false,
+                                        isCampus: true,
+                                    });
+                                    const flatItems = flattenFunctionItems(assocResp?.resultbody || []);
+                                    const exact = flatItems.find((item) => normalize(item.value) === normalize(desiredRole));
+                                    const fuzzy = exact || flatItems.find((item) => normalize(item.value).includes(normalize(desiredRole)));
+                                    if (fuzzy?.code && fuzzy?.value) {
+                                        expectFunction = fuzzy.code;
+                                        expectFunctionName = fuzzy.value;
+                                        functionUpdated = true;
+                                    }
+                                } catch (error) {
+                                    // Keep current function when dictionary search is unavailable.
+                                }
+                            }
+
+                            let expectArea = currentIntention.expectArea || '';
+                            let areaUpdated = false;
+                            const locations = splitLocations(jobPreferences.locations || '');
+                            if (locations.length) {
+                                const areaCodes = [];
+                                for (const location of locations.slice(0, 3)) {
+                                    try {
+                                        const areaResp = await api.getAreaDict({ keyword: location });
+                                        const areaItems = collectAreaItems(areaResp?.resultbody || []);
+                                        const exactArea = areaItems.find((item) => normalize(item.value) === normalize(location));
+                                        const fuzzyArea = exactArea || areaItems.find((item) => normalize(item.value).includes(normalize(location)));
+                                        if (fuzzyArea?.code) {
+                                            areaCodes.push(fuzzyArea.code);
+                                        }
+                                    } catch (error) {
+                                        // Ignore one-off area lookup failures and keep current areas.
+                                    }
+                                }
+                                if (areaCodes.length) {
+                                    expectArea = unique(areaCodes).join(',');
+                                    areaUpdated = true;
+                                }
+                            }
+
+                            const salaryRange = parseSalaryRange(jobPreferences.salary || '');
+                            const seekTypeMap = { '全职': '0', '兼职': '1', '实习': '2' };
+                            const nextSeekType = seekTypeMap[jobPreferences.job_type] ?? String(currentIntention.seekType ?? '0');
+                            const nextSalaryMonth = salaryMonth || Number(currentIntention.salaryMonth || 12) || 12;
+                            const minSalary = salaryRange.min || Number(currentIntention.minSalary || 0) || null;
+                            const maxSalary = salaryRange.max || Number(currentIntention.maxSalary || 0) || null;
+
+                            await api.editIntention(
+                                currentIntention.id,
+                                {
+                                    salaryType: 1,
+                                    expectArea,
+                                    expectIndustry: currentIntention.expectIndustry || null,
+                                    expectFunction,
+                                    expectFunctionName,
+                                    seekType: nextSeekType,
+                                    maxSalary,
+                                    minSalary,
+                                    isEnglish: false,
+                                    salaryMonth: nextSalaryMonth,
+                                    intentionPreference: currentIntention.intentionPreference || {},
+                                }
+                            );
+
+                            const intentionChanges = [];
+                            if (functionUpdated) intentionChanges.push('职位');
+                            if (areaUpdated) intentionChanges.push('城市');
+                            if (salaryRange.min || salaryRange.max) intentionChanges.push('薪资');
+                            if (jobPreferences.job_type) intentionChanges.push('工作类型');
+                            messages.push(
+                                intentionChanges.length
+                                    ? `求职意向已同步(${intentionChanges.join('、')})`
+                                    : '求职意向已同步(沿用当前职位/城市，仅校验保存)'
+                            );
+                        } else {
+                            messages.push('求职意向跳过');
+                        }
+
+                        const personalSkill = resumeItem.personalSkills?.[0];
+                        const masterSkills = unique(masterResume?.skills || []);
+                        if (personalSkill?.questions?.length && masterSkills.length) {
+                            const masterSkillSet = new Set(masterSkills.map((item) => normalize(item)));
+                            const questions = personalSkill.questions.map((question) => {
+                                const matched = (question.answers || []).filter((answer) => masterSkillSet.has(normalize(answer.title)));
+                                const fallback = matched.length
+                                    ? matched
+                                    : (question.answers || []).filter((answer) => answer.isSelected);
+                                return {
+                                    id: String(question.id),
+                                    answers: fallback.map((answer) => ({
+                                        code: String(answer.code),
+                                        isSelected: true,
+                                        title: answer.title,
+                                    })),
+                                };
+                            });
+                            await api.perSkillEdit({
+                                isEnglish: false,
+                                scene: '简历中心',
+                                policyName: personalSkill.policyName,
+                                policyId: personalSkill.policyId,
+                                function: personalSkill.function,
+                                questions,
+                            });
+                            const selectedCount = questions.reduce((sum, item) => sum + item.answers.length, 0);
+                            messages.push(`技能经验已同步(${selectedCount}项)`);
+                        } else if (personalSkill?.questions?.length) {
+                            messages.push('技能经验跳过');
+                        } else {
+                            messages.push('技能经验跳过');
+                        }
+
+                        return {
+                            success: true,
+                            message: messages.join('；'),
+                        };
+                    }""",
+                    {"masterResume": master_resume},
+                )
+                return dict(sync_result or {"success": True, "message": "前程无忧同步完成"})
+            finally:
+                with contextlib.suppress(Exception):
+                    await context.close()
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        await browser.close()
+                self._terminate_chrome_process(chrome_pid)
+
+    @staticmethod
+    def _parse_resume_lines(lines: list[str], source_url: str) -> dict:
+        normalized_lines = [re.sub(r"\s+", " ", str(line or "")).strip() for line in lines if str(line or "").strip()]
+
+        def is_date_line(value: str) -> bool:
+            return bool(re.search(r"\d{4}[./-]\d{1,2}\s*-\s*(?:\d{4}[./-]\d{1,2}|至今)", value))
+
+        def find_index(candidates: list[str], start_at: int = 0) -> int | None:
+            for idx in range(start_at, len(normalized_lines)):
+                if normalized_lines[idx] in candidates:
+                    return idx
+            return None
+
+        content_start = find_index(["预览"]) or 0
+
+        def section_slice(name: str, next_names: list[str]) -> list[str]:
+            start_idx = find_index([name], content_start)
+            if start_idx is None:
+                return []
+            start = start_idx + 1
+            end = len(normalized_lines)
+            for next_name in next_names:
+                next_idx = find_index([next_name], start)
+                if next_idx is not None:
+                    end = min(end, next_idx)
+            return normalized_lines[start:end]
+
+        summary_lines = section_slice("个人优势", ["求职意向"])
+        preference_lines = section_slice("求职意向", ["技能经验"])
+        skill_lines = section_slice("技能经验", ["工作经历"])
+        work_lines = section_slice("工作经历", ["项目经历"])
+        project_lines = section_slice("项目经历", ["教育经历"])
+        education_lines = section_slice("教育经历", ["在校荣誉/职务"])
+        honor_lines = section_slice("在校荣誉/职务", ["语言能力"])
+        language_lines = section_slice("语言能力", ["个人作品"])
+        certificate_lines = section_slice("资格证书", ["自定义添加", "附件管理"])
+        attachment_lines = section_slice("附件管理", ["简历设置", "小程序"])
+
+        name = ""
+        headline = ""
+        contact_summary = ""
+        for idx, value in enumerate(normalized_lines):
+            if value == "预览" and idx + 9 < len(normalized_lines):
+                name = normalized_lines[idx + 1]
+                headline = " / ".join(normalized_lines[idx + 3 : idx + 8])
+                contact_summary = " ".join(normalized_lines[idx + 8 : idx + 11])
+                break
+
+        contact_tokens = [token for token in contact_summary.split() if token]
+        wechat_id = ""
+        for token in contact_tokens:
+            if "@" not in token and not re.search(r"\d{3}\*+\d{4}", token):
+                wechat_id = token
+                break
+
+        job_preferences = {
+            "desired_role": preference_lines[0] if len(preference_lines) > 0 else "",
+            "job_type": preference_lines[1] if len(preference_lines) > 1 else "",
+            "salary": preference_lines[2] if len(preference_lines) > 2 else "",
+            "locations": preference_lines[3] if len(preference_lines) > 3 else "",
+            "industry": preference_lines[4] if len(preference_lines) > 4 else "",
+            "raw_tokens": preference_lines,
+        }
+
+        work_experiences: list[dict] = []
+        idx = 0
+        while idx + 3 < len(work_lines):
+            company = work_lines[idx]
+            title = work_lines[idx + 1]
+            employment_type = work_lines[idx + 2]
+            date_range = work_lines[idx + 3]
+            if not is_date_line(date_range):
+                idx += 1
+                continue
+            idx += 4
+            tags: list[str] = []
+            description_parts: list[str] = []
+            while idx < len(work_lines):
+                current = work_lines[idx]
+                if idx + 3 < len(work_lines) and is_date_line(work_lines[idx + 3]):
+                    break
+                if len(current) <= 24 and "\n" not in current and "：" not in current:
+                    tags.append(current)
+                else:
+                    description_parts.append(current)
+                idx += 1
+            work_experiences.append(
+                {
+                    "company": company,
+                    "title": title,
+                    "employment_type": employment_type,
+                    "date_range": date_range,
+                    "tags": tags,
+                    "description": "\n".join(description_parts).strip(),
+                }
+            )
+
+        project_experiences: list[dict] = []
+        idx = 0
+        while idx + 1 < len(project_lines):
+            name_line = project_lines[idx]
+            date_range = project_lines[idx + 1]
+            if not is_date_line(date_range):
+                idx += 1
+                continue
+            idx += 2
+            description_parts: list[str] = []
+            while idx < len(project_lines):
+                current = project_lines[idx]
+                if idx + 1 < len(project_lines) and is_date_line(project_lines[idx + 1]):
+                    break
+                description_parts.append(current)
+                idx += 1
+            project_experiences.append(
+                {"name": name_line, "date_range": date_range, "role": "", "description": "\n".join(description_parts).strip()}
+            )
+
+        education_experiences: list[dict] = []
+        idx = 0
+        while idx + 4 < len(education_lines):
+            school = education_lines[idx]
+            date_range = education_lines[idx + 1]
+            major = education_lines[idx + 2]
+            degree = education_lines[idx + 3]
+            study_mode = education_lines[idx + 4]
+            if not is_date_line(date_range):
+                idx += 1
+                continue
+            education_experiences.append(
+                {
+                    "school": school,
+                    "date_range": date_range,
+                    "major": major,
+                    "degree": degree,
+                    "study_mode": study_mode,
+                }
+            )
+            idx += 5
+
+        attachments: list[dict] = []
+        for idx, value in enumerate(attachment_lines):
+            if value.endswith(".pdf") or value.endswith(".doc") or value.endswith(".docx"):
+                attachments.append(
+                    {"name": value, "meta": attachment_lines[idx + 1] if idx + 1 < len(attachment_lines) else ""}
+                )
+
+        return {
+            "source_url": source_url,
+            "full_name": name,
+            "headline": headline,
+            "contact_summary": contact_summary,
+            "wechat_id": wechat_id,
+            "summary": "\n".join(summary_lines).strip(),
+            "job_preferences": job_preferences,
+            "work_experiences": work_experiences,
+            "project_experiences": project_experiences,
+            "education_experiences": education_experiences,
+            "certificates": certificate_lines,
+            "skills": skill_lines,
+            "languages": language_lines,
+            "attachments": attachments,
+            "raw_snapshot": {"lines": normalized_lines, "honors": honor_lines},
+        }

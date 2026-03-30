@@ -19,6 +19,7 @@ from app.automation.browser_factory import (
 )
 from app.core.config import settings
 from app.models.entities import Account, Platform
+from app.services.profile_path_resolver import resolve_profile_dir
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,7 @@ class AccountBrowserService:
 
     @staticmethod
     def _normalize_profile_dir(profile_dir: str) -> str:
-        profile_path = Path(profile_dir)
-        if not profile_path.is_absolute():
-            profile_path = Path.cwd() / profile_path
-        return str(profile_path.resolve())
+        return resolve_profile_dir(profile_dir)
 
     def is_profile_occupied(self, profile_dir: str) -> bool:
         normalized_profile_dir = self._normalize_profile_dir(profile_dir)

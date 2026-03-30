@@ -38,6 +38,14 @@ class ChatSendStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class ResumeSyncStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
 class RuleConfig(Base):
     __tablename__ = "rule_configs"
 
@@ -159,3 +167,76 @@ class TaskLog(Base):
     message: Mapped[str] = mapped_column(Text)
     extra_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+
+
+class MasterResume(Base):
+    __tablename__ = "master_resumes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source_platform: Mapped[str] = mapped_column(String(20), default="")
+    source_account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
+    source_label: Mapped[str] = mapped_column(String(120), default="")
+    source_url: Mapped[str] = mapped_column(Text, default="")
+    full_name: Mapped[str] = mapped_column(String(120), default="")
+    headline: Mapped[str] = mapped_column(String(255), default="")
+    contact_summary: Mapped[str] = mapped_column(String(255), default="")
+    wechat_id: Mapped[str] = mapped_column(String(120), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    job_preferences: Mapped[dict] = mapped_column(JSON, default=dict)
+    work_experiences: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    project_experiences: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    education_experiences: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    certificates: Mapped[list[str]] = mapped_column(JSON, default=list)
+    skills: Mapped[list[str]] = mapped_column(JSON, default=list)
+    languages: Mapped[list[str]] = mapped_column(JSON, default=list)
+    attachments: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    raw_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=local_now, onupdate=local_now)
+
+    source_account: Mapped["Account | None"] = relationship()
+
+
+class ResumeImportLog(Base):
+    __tablename__ = "resume_import_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source_platform: Mapped[str] = mapped_column(String(20), index=True)
+    source_account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default=ResumeSyncStatus.PENDING.value)
+    message: Mapped[str] = mapped_column(Text, default="")
+    extra_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    source_account: Mapped["Account | None"] = relationship()
+
+
+class ResumeSyncRun(Base):
+    __tablename__ = "resume_sync_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    master_resume_id: Mapped[int | None] = mapped_column(ForeignKey("master_resumes.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default=ResumeSyncStatus.PENDING.value)
+    message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    master_resume: Mapped["MasterResume | None"] = relationship()
+    targets: Mapped[list["ResumeSyncTarget"]] = relationship(back_populates="sync_run")
+
+
+class ResumeSyncTarget(Base):
+    __tablename__ = "resume_sync_targets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    sync_run_id: Mapped[int] = mapped_column(ForeignKey("resume_sync_runs.id"))
+    target_platform: Mapped[str] = mapped_column(String(20), index=True)
+    target_account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default=ResumeSyncStatus.PENDING.value)
+    message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    sync_run: Mapped["ResumeSyncRun"] = relationship(back_populates="targets")
+    target_account: Mapped["Account | None"] = relationship()

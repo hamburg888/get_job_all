@@ -1,14 +1,16 @@
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
 
 from app.automation.adapters.qiancheng_adapter import QianchengAdapter
+from app.automation.async_runner import run_async_blocking
 from app.automation.browser_factory import (
     LAODENG_INIT_SCRIPT,
     STEALTH_INIT_SCRIPT,
@@ -1341,3 +1343,479 @@ class LiepinAdapter(QianchengAdapter):
                         return locator
             await self._sleep_or_stop(0.2, should_stop)
         return None
+
+    def import_resume_snapshot(
+        self,
+        profile_dir: str,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://c.liepin.com/resume/edit",
+    ) -> dict:
+        return run_async_blocking(self._import_resume_snapshot(profile_dir, headless=headless, target_url=target_url))
+
+    async def _import_resume_snapshot(
+        self,
+        profile_dir: str,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://c.liepin.com/resume/edit",
+    ) -> dict:
+        from playwright.async_api import async_playwright
+
+        launch_headless = settings.browser_headless if headless is None else headless
+        use_persistent_context = bool(launch_headless and not settings.browser_fake_headless)
+
+        async with async_playwright() as playwright:
+            browser = None
+            chrome_pid: int | None = None
+            if use_persistent_context:
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **build_browser_launch_options(launch_headless),
+                )
+            else:
+                chrome_path = self._resolve_chrome_executable()
+                profile_path = Path(profile_dir)
+                if not profile_path.is_absolute():
+                    profile_path = Path.cwd() / profile_path
+                profile_path.mkdir(parents=True, exist_ok=True)
+
+                debug_port = self._pick_free_port()
+                chrome_pid = self._launch_external_chrome(
+                    chrome_path,
+                    profile_path,
+                    debug_port,
+                    target_url,
+                    launch_options=build_browser_launch_options(launch_headless),
+                )
+                ws_endpoint = self._wait_for_cdp_endpoint(debug_port, timeout=20, should_stop=lambda: False)
+                if not ws_endpoint:
+                    raise RuntimeError("猎聘简历浏览器已启动，但未能连接到调试端口。")
+                browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
+            await context.add_init_script(LAODENG_INIT_SCRIPT)
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_timeout(1200)
+                if await self.is_login_required(page):
+                    raise RuntimeError("猎聘当前未登录，请先在账号配置浏览器中完成登录后再导入。")
+                return await self._read_resume_snapshot(page)
+            finally:
+                with contextlib.suppress(Exception):
+                    await context.close()
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        await browser.close()
+                self._terminate_chrome_process(chrome_pid)
+
+    async def _read_resume_snapshot(self, page) -> dict:
+        return await page.evaluate(
+            """() => {
+                const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                const lines = document.body.innerText
+                    .split('\\n')
+                    .map((line) => normalize(line))
+                    .filter(Boolean);
+                const findSection = (title) =>
+                    Array.from(document.querySelectorAll('.resume-section')).find((el) =>
+                        normalize(el.querySelector('.resume-section-header')?.textContent || '').includes(title)
+                    );
+                const readTexts = (selector, root = document) =>
+                    Array.from(root.querySelectorAll(selector))
+                        .map((el) => normalize(el.textContent))
+                        .filter(Boolean);
+
+                const basicSection = document.querySelector('.basic-info-box .resume-section');
+                const basicMeta = basicSection?.querySelector('.ant-card-meta');
+                const name = normalize(basicMeta?.querySelector('.ant-card-meta-title')?.textContent || '');
+                const basicInfoLine = normalize(
+                    basicMeta?.querySelector('.basic-info-view-one')?.textContent ||
+                    basicMeta?.querySelector('.ant-card-meta-description')?.textContent ||
+                    ''
+                );
+                const contactSummary = normalize(basicMeta?.querySelector('.basic-info-view-two')?.textContent || '');
+                const contactTokens = contactSummary.split(/(?=\\d{3}\\*{2,}\\d{4}|\\d{2}\\*{2,}\\d+@)/).map((token) => normalize(token)).filter(Boolean);
+                const wechatId = contactTokens.length > 2 ? contactTokens[2] : contactTokens[contactTokens.length - 1] || '';
+
+                const summary = normalize(document.querySelector('.self-assess-box .section-content, .self-assess-box .section-desc')?.textContent || '');
+
+                const expectationSection = findSection('求职期望');
+                const expectationInner = expectationSection?.querySelector('.job-want-view-item-inner .item-header') || expectationSection?.querySelector('.resume-section-content');
+                const expectationTokens = Array.from(expectationInner?.querySelectorAll('.title-text, .job-title, .flex-names, .work-type-tag') || [])
+                    .map((el) => normalize(el.textContent))
+                    .filter((item) => item && item !== '|');
+
+                const workExperiences = Array.from(document.querySelectorAll('.work-exp-container .work-exp-view-item')).map((item) => ({
+                    company: normalize(item.querySelector('.item-header .item-title')?.textContent || ''),
+                    date_range: normalize(item.querySelector('.item-header .item-title-time')?.textContent || ''),
+                    title: normalize(item.querySelector('.item-content .item-content-title')?.textContent || '').replace(/实习$|全职$|兼职$/,''),
+                    employment_type: normalize(item.querySelector('.item-content .item-content-title')?.textContent || '').match(/(实习|全职|兼职)$/)?.[0] || '',
+                    description: normalize(item.querySelector('.item-content .item-content-duty')?.textContent || ''),
+                })).filter((item) => item.company || item.title || item.description);
+
+                const projectExperiences = Array.from(document.querySelectorAll('.project-exp-container .project-exp-view-item')).map((item) => ({
+                    name: normalize(item.querySelector('.item-header .item-title')?.textContent || ''),
+                    date_range: normalize(item.querySelector('.item-header .item-title-time')?.textContent || ''),
+                    role: normalize(item.querySelector('.item-content > *:first-child')?.textContent || ''),
+                    description: normalize(Array.from(item.querySelectorAll('.item-content > *')).slice(1).map((el) => normalize(el.textContent)).join('\\n')),
+                })).filter((item) => item.name || item.description);
+
+                const educationExperiences = Array.from(document.querySelectorAll('.edu-exp-container .edu-exp-view-item')).map((item) => ({
+                    school: normalize(item.querySelector('.edu-view-content .item-title')?.textContent || item.querySelector('.edu-view-content')?.childNodes?.[0]?.textContent || ''),
+                    date_range: normalize(item.querySelector('.edu-view-content .item-title-time')?.textContent || ''),
+                    study_mode: normalize(item.querySelector('.edu-view-content .item-sub-title')?.textContent || ''),
+                    degree_major: normalize(item.querySelector('.edu-view-content .item-content')?.textContent || ''),
+                    description: normalize(item.querySelector('.edu-experience')?.textContent || ''),
+                })).filter((item) => item.school || item.degree_major || item.description);
+
+                const attachmentCards = Array.from(document.querySelectorAll('.attachment-box .resume-card-container')).map((item) => ({
+                    name: normalize(item.querySelector('.file-con')?.childNodes?.[0]?.textContent || item.querySelector('.file-title')?.textContent || ''),
+                    meta: normalize(item.querySelector('.file-con')?.textContent || ''),
+                })).filter((item) => item.name || item.meta);
+
+                return {
+                    source_url: window.location.href,
+                    full_name: name,
+                    headline: basicInfoLine,
+                    contact_summary: contactSummary,
+                    wechat_id: wechatId,
+                    summary,
+                    job_preferences: {
+                        desired_role: expectationTokens[0] || '',
+                        salary: expectationTokens[1] || '',
+                        locations: expectationTokens[2] || '',
+                        industries: expectationTokens[3] || '',
+                        career_stage: expectationTokens[4] || '',
+                        raw_tokens: expectationTokens,
+                    },
+                    work_experiences: workExperiences,
+                    project_experiences: projectExperiences,
+                    education_experiences: educationExperiences,
+                    certificates: readTexts('.credential-tags-container .skill-label'),
+                    skills: readTexts('.labels-container .skill-label'),
+                    languages: readTexts('.language-container .language-view-item'),
+                    attachments: attachmentCards,
+                    raw_snapshot: {
+                        lines,
+                        sections: {
+                            summary,
+                            job_preferences: expectationTokens,
+                            certificates: readTexts('.credential-tags-container .skill-label'),
+                            skills: readTexts('.labels-container .skill-label'),
+                            languages: readTexts('.language-container .language-view-item'),
+                        },
+                    },
+                };
+            }"""
+        )
+
+    def sync_master_resume(
+        self,
+        profile_dir: str,
+        master_resume: dict,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://c.liepin.com/resume/edit",
+    ) -> dict:
+        return run_async_blocking(
+            self._sync_master_resume(
+                profile_dir,
+                master_resume,
+                headless=headless,
+                target_url=target_url,
+            )
+        )
+
+    async def _sync_master_resume(
+        self,
+        profile_dir: str,
+        master_resume: dict,
+        *,
+        headless: bool | None = None,
+        target_url: str = "https://c.liepin.com/resume/edit",
+    ) -> dict:
+        from playwright.async_api import async_playwright
+
+        launch_headless = settings.browser_headless if headless is None else headless
+        use_persistent_context = bool(launch_headless and not settings.browser_fake_headless)
+
+        async with async_playwright() as playwright:
+            browser = None
+            chrome_pid: int | None = None
+            if use_persistent_context:
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **build_browser_launch_options(launch_headless),
+                )
+            else:
+                chrome_path = self._resolve_chrome_executable()
+                profile_path = Path(profile_dir)
+                if not profile_path.is_absolute():
+                    profile_path = Path.cwd() / profile_path
+                profile_path.mkdir(parents=True, exist_ok=True)
+
+                debug_port = self._pick_free_port()
+                chrome_pid = self._launch_external_chrome(
+                    chrome_path,
+                    profile_path,
+                    debug_port,
+                    target_url,
+                    launch_options=build_browser_launch_options(launch_headless),
+                )
+                ws_endpoint = self._wait_for_cdp_endpoint(debug_port, timeout=20, should_stop=lambda: False)
+                if not ws_endpoint:
+                    raise RuntimeError("猎聘简历同步浏览器已启动，但未能连接到调试端口。")
+                browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
+            await context.add_init_script(LAODENG_INIT_SCRIPT)
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded")
+                with contextlib.suppress(Exception):
+                    await page.wait_for_timeout(1200)
+                if await self.is_login_required(page):
+                    raise RuntimeError("猎聘当前未登录，请先在账号配置浏览器中完成登录后再同步。")
+
+                detail_payload = await self._fetch_resume_detail_payload(page)
+                detail_data = dict(detail_payload.get("data") or {})
+                encry_res_id = str(detail_data.get("resId") or "")
+                if not encry_res_id:
+                    raise RuntimeError("未能读取猎聘简历标识，暂时无法执行同步。")
+
+                section_results: list[str] = []
+                summary_result = await self._sync_self_assessment(page, encry_res_id, master_resume)
+                section_results.append(summary_result)
+
+                labels_result = await self._sync_skill_labels(page, encry_res_id, master_resume)
+                section_results.append(labels_result)
+
+                job_want_result = await self._sync_job_want(page, encry_res_id, detail_data, master_resume)
+                section_results.append(job_want_result)
+
+                return {
+                    "success": True,
+                    "message": "；".join(result for result in section_results if result),
+                }
+            finally:
+                with contextlib.suppress(Exception):
+                    await context.close()
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        await browser.close()
+                self._terminate_chrome_process(chrome_pid)
+
+    async def _fetch_resume_detail_payload(self, page) -> dict:
+        response = await self._liepin_fetch(
+            page,
+            "https://api-c.liepin.com/api/com.liepin.cresume.web-resume-detail",
+            method="POST",
+            content_type="application/x-www-form-urlencoded",
+            body="encryResId=",
+        )
+        if not response.get("flag"):
+            raise RuntimeError(str(response.get("msg") or "读取猎聘简历详情失败。"))
+        return response
+
+    async def _sync_self_assessment(self, page, encry_res_id: str, master_resume: dict) -> str:
+        summary = self._normalize_text(master_resume.get("summary"))
+        if not summary:
+            return "优势亮点跳过"
+
+        response = await self._liepin_fetch(
+            page,
+            "https://api-c.liepin.com/api/com.liepin.cresume.save-self-assess",
+            method="POST",
+            content_type="application/json;charset=UTF-8;",
+            body=json.dumps(
+                {
+                    "data": {
+                        "encryResId": encry_res_id,
+                        "selfAssessment": summary,
+                    }
+                },
+                ensure_ascii=False,
+            ),
+        )
+        if not response.get("flag"):
+            raise RuntimeError(str(response.get("msg") or "写回猎聘优势亮点失败。"))
+        return "优势亮点已同步"
+
+    async def _sync_skill_labels(self, page, encry_res_id: str, master_resume: dict) -> str:
+        labels = self._normalize_skill_labels(master_resume.get("skills") or [])
+        if not labels:
+            return "技能标签跳过"
+
+        label_payload = [{"label": label, "type": 0} for label in labels]
+        body = (
+            f"encryResId={quote_plus(encry_res_id)}"
+            f"&labels={quote_plus(json.dumps(label_payload, ensure_ascii=False))}"
+        )
+        response = await self._liepin_fetch(
+            page,
+            "https://api-c.liepin.com/api/com.liepin.cresume.save-personal-labels",
+            method="POST",
+            content_type="application/x-www-form-urlencoded",
+            body=body,
+        )
+        if not response.get("flag"):
+            raise RuntimeError(str(response.get("msg") or "写回猎聘技能标签失败。"))
+        return f"技能标签已同步({len(labels)}项)"
+
+    async def _sync_job_want(self, page, encry_res_id: str, detail_data: dict, master_resume: dict) -> str:
+        current_job_wants = list(detail_data.get("jobWants") or [])
+        if not current_job_wants:
+            return "求职期望跳过"
+
+        payload = self._build_job_want_payload(encry_res_id, current_job_wants[0], master_resume.get("job_preferences") or {})
+        response = await self._liepin_fetch(
+            page,
+            "https://api-c.liepin.com/api/com.liepin.cresume.save-job-want.v4",
+            method="POST",
+            content_type="application/json;charset=UTF-8;",
+            body=json.dumps(payload, ensure_ascii=False),
+        )
+        if not response.get("flag"):
+            raise RuntimeError(str(response.get("msg") or "写回猎聘求职期望失败。"))
+        return "求职期望已同步(薪资已更新，职位/地点沿用猎聘当前配置)"
+
+    async def _liepin_fetch(
+        self,
+        page,
+        url: str,
+        *,
+        method: str,
+        content_type: str,
+        body: str,
+    ) -> dict:
+        return await page.evaluate(
+            """async ({ url, method, contentType, body }) => {
+                const xsrfToken = document.cookie
+                    .split(';')
+                    .map((item) => item.trim())
+                    .find((item) => item.startsWith('XSRF-TOKEN='))
+                    ?.split('=')[1] || '';
+                const headers = {
+                    'accept': 'application/json, text/plain, */*',
+                    'content-type': contentType,
+                    'x-client-type': 'web',
+                    'x-requested-with': 'XMLHttpRequest',
+                };
+                if (xsrfToken) {
+                    headers['x-xsrf-token'] = decodeURIComponent(xsrfToken);
+                }
+                const response = await fetch(url, {
+                    method,
+                    credentials: 'include',
+                    headers,
+                    body,
+                });
+                return await response.json();
+            }""",
+            {
+                "url": url,
+                "method": method,
+                "contentType": content_type,
+                "body": body,
+            },
+        )
+
+    def _build_job_want_payload(self, encry_res_id: str, current_job_want: dict, job_preferences: dict) -> dict:
+        work_type = str(current_job_want.get("workType") or "0")
+        want_salary_low = int(current_job_want.get("wantSalaryLow") or 0)
+        want_salary_high = int(current_job_want.get("wantSalaryHigh") or 0)
+        want_salary_months = int(current_job_want.get("wantSalaryMonths") or 12)
+
+        parsed_salary = self._parse_expected_salary(str(job_preferences.get("salary") or ""))
+        if parsed_salary:
+            want_salary_low, want_salary_high, parsed_months = parsed_salary
+            want_salary_months = parsed_months or want_salary_months
+
+        payload = {
+            "encryResId": encry_res_id,
+            "dqCode": str(current_job_want.get("dqCode") or ""),
+            "jobtitleCode": str(
+                current_job_want.get("jobtitleCode")
+                or current_job_want.get("jobTitleCode")
+                or ""
+            ),
+            "wantSalaryHigh": int(max(want_salary_high, 0)),
+            "wantSalaryLow": int(max(want_salary_low, 0)),
+            "wantSalaryMonths": int(max(want_salary_months, 1)),
+            "otherExpectDqCodes": list(current_job_want.get("otherExpectDqCodes") or []),
+            "industryCodes": ",".join(list(current_job_want.get("industryCodes") or ["000"])),
+        }
+
+        if current_job_want.get("id"):
+            payload["id"] = current_job_want["id"]
+        if current_job_want.get("workStatusCode"):
+            payload["workStatusCode"] = current_job_want["workStatusCode"]
+        if current_job_want.get("workType"):
+            payload["workType"] = work_type
+            if work_type == "1":
+                payload["practiceMonths"] = int(current_job_want.get("practiceMonths") or 0)
+                payload["workweek"] = int(current_job_want.get("workweek") or 0)
+        return payload
+
+    @staticmethod
+    def _normalize_text(value: object) -> str:
+        return re.sub(r"\n{3,}", "\n\n", str(value or "")).strip()
+
+    @staticmethod
+    def _normalize_skill_labels(skills: list[object]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in skills:
+            label = str(item or "").strip()
+            if not label:
+                continue
+            key = label.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(label[:15])
+            if len(normalized) >= 10:
+                break
+        return normalized
+
+    @staticmethod
+    def _parse_expected_salary(raw_salary: str) -> tuple[int, int, int | None] | None:
+        normalized = str(raw_salary or "").replace(" ", "").replace("·", "").lower()
+        if not normalized:
+            return None
+
+        months_match = re.search(r"(\d+)\s*[薪x×月]", normalized)
+        months = int(months_match.group(1)) if months_match else None
+
+        range_match = re.search(
+            r"(\d+(?:\.\d+)?)\s*(k|千|万)?\s*[-~到]\s*(\d+(?:\.\d+)?)\s*(k|千|万)?",
+            normalized,
+        )
+        if range_match:
+            left_value = float(range_match.group(1))
+            left_unit = range_match.group(2) or range_match.group(4) or "千"
+            right_value = float(range_match.group(3))
+            right_unit = range_match.group(4) or left_unit
+            low = LiepinAdapter._salary_value_to_yuan(left_value, left_unit)
+            high = LiepinAdapter._salary_value_to_yuan(right_value, right_unit)
+            return int(low), int(high), months
+
+        single_match = re.search(r"(\d+(?:\.\d+)?)\s*(k|千|万)", normalized)
+        if single_match:
+            value = LiepinAdapter._salary_value_to_yuan(float(single_match.group(1)), single_match.group(2))
+            return int(value), int(value), months
+        return None
+
+    @staticmethod
+    def _salary_value_to_yuan(value: float, unit: str) -> int:
+        normalized_unit = (unit or "").lower()
+        if normalized_unit in {"万"}:
+            return int(round(value * 10000))
+        return int(round(value * 1000))

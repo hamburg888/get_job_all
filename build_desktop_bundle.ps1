@@ -3,7 +3,9 @@ param(
     [string]$EmbeddedFrontendPath = (Join-Path $PSScriptRoot 'frontend_dist'),
     [string]$DesktopAssetsPath = (Join-Path $PSScriptRoot 'desktop_assets'),
     [string]$PythonExe = (Join-Path $PSScriptRoot '.venv\Scripts\python.exe'),
-    [switch]$SkipPyInstaller
+    [switch]$SkipPyInstaller,
+    [switch]$SkipInstaller,
+    [string]$InnoSetupCompiler = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,16 +21,30 @@ $desktopAssetsRoot = Resolve-FullPath $DesktopAssetsPath
 $pythonPath = Resolve-FullPath $PythonExe
 $frontendDist = Join-Path $frontendRoot 'dist'
 $desktopOutput = Join-Path $PSScriptRoot 'dist_desktop'
+$installerOutput = Join-Path $PSScriptRoot 'dist_installer'
 $buildOutput = Join-Path $PSScriptRoot 'build'
 $specPath = Join-Path $PSScriptRoot 'JobHelpDesktop.spec'
+$installerSpecPath = Join-Path $PSScriptRoot 'JobHelpDesktop.iss'
 $templateDbPath = Join-Path $desktopAssetsRoot 'job_help.template.db'
 $appIconPath = Join-Path $desktopAssetsRoot 'app_icon.ico'
+
+if (-not $InnoSetupCompiler) {
+    $compilerCandidates = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+        'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+        'C:\Program Files\Inno Setup 6\ISCC.exe'
+    )
+    $InnoSetupCompiler = $compilerCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
 
 Write-Host "==> 前端项目: $frontendRoot"
 Write-Host "==> 嵌入目录: $embeddedRoot"
 Write-Host "==> 桌面资源: $desktopAssetsRoot"
 Write-Host "==> Python: $pythonPath"
 Write-Host "==> 应用图标: $appIconPath"
+if ($InnoSetupCompiler) {
+    Write-Host "==> Inno Setup: $InnoSetupCompiler"
+}
 
 if (-not (Test-Path $frontendRoot)) {
     throw "未找到前端项目目录: $frontendRoot"
@@ -40,6 +56,10 @@ if (-not (Test-Path $pythonPath)) {
 
 if (-not (Test-Path $specPath)) {
     throw "未找到 PyInstaller 规格文件: $specPath"
+}
+
+if (-not (Test-Path $installerSpecPath)) {
+    throw "未找到安装包脚本: $installerSpecPath"
 }
 
 Push-Location $frontendRoot
@@ -92,11 +112,21 @@ Write-Host "==> 检查 PyInstaller"
 & $pythonPath -m PyInstaller --version | Out-Null
 
 if (Test-Path $desktopOutput) {
-    Remove-Item -Path $desktopOutput -Recurse -Force
+    try {
+        Remove-Item -Path $desktopOutput -Recurse -Force
+    }
+    catch {
+        throw "无法清理旧的桌面版输出目录，请先关闭正在运行的 JobHelpDesktop 程序或释放占用文件后再重试。目录: $desktopOutput"
+    }
 }
 
 if (Test-Path $buildOutput) {
-    Remove-Item -Path $buildOutput -Recurse -Force
+    try {
+        Remove-Item -Path $buildOutput -Recurse -Force
+    }
+    catch {
+        throw "无法清理旧的构建缓存目录，请关闭占用文件的进程后重试。目录: $buildOutput"
+    }
 }
 
 Write-Host "==> 开始打包桌面版"
@@ -108,3 +138,32 @@ Write-Host "==> 开始打包桌面版"
     $specPath
 
 Write-Host "==> 打包完成: $(Join-Path $desktopOutput 'JobHelpDesktop')"
+
+if ($SkipInstaller) {
+    Write-Host "==> 已跳过安装包生成"
+    exit 0
+}
+
+if (-not $InnoSetupCompiler) {
+    Write-Host "==> 未检测到 Inno Setup，已完成目录版打包。"
+    Write-Host "   安装 Inno Setup 6 后，重新执行本脚本即可生成安装包。"
+    exit 0
+}
+
+if (Test-Path $installerOutput) {
+    try {
+        Remove-Item -Path $installerOutput -Recurse -Force
+    }
+    catch {
+        throw "无法清理旧的安装包输出目录，请关闭占用文件的进程后重试。目录: $installerOutput"
+    }
+}
+
+$appVersion = '0.1.0'
+
+Write-Host "==> 开始生成安装包"
+& $InnoSetupCompiler `
+    "/DMyAppVersion=$appVersion" `
+    $installerSpecPath
+
+Write-Host "==> 安装包生成完成: $installerOutput"
