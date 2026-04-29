@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     log_root: str = Field(default_factory=_default_log_root)
     liepin_entry_url: str = "https://www.liepin.com/zhaopin/"
     liepin_login_url: str = "https://www.liepin.com/"
+    yupao_entry_url: str = "https://www.yupao.com/zhaogong/a76_rmgz/"
+    yupao_login_url: str = "https://www.yupao.com/"
+    yupao_chat_url: str = "https://www.yupao.com/chat/"
     zhilian_entry_url: str = "https://www.zhaopin.com/sou/jl763/p1"
     qiancheng_entry_url: str = "https://we.51job.com/pc/search"
     qiancheng_login_url: str = "https://login.51job.com/login.php"

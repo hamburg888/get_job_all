@@ -13,6 +13,7 @@ from sqlalchemy import desc, select
 from app.automation.adapters.boss_adapter import BossAdapter
 from app.automation.adapters.liepin_adapter import LiepinAdapter
 from app.automation.adapters.qiancheng_adapter import QianchengAdapter
+from app.automation.adapters.yupao_adapter import YupaoAdapter
 from app.automation.adapters.zhilian_adapter import ZhilianAdapter, ZhilianDailyLimitReached
 from app.core.config import settings
 from app.core.time_utils import local_now
@@ -62,6 +63,10 @@ class TaskRunner:
         return ""
 
     @staticmethod
+    def _platform_supports_chat(platform: Platform) -> bool:
+        return platform in {Platform.BOSS, Platform.LIEPIN, Platform.YUPAO}
+
+    @staticmethod
     def _normalize_text_filters(values: list[str]) -> list[str]:
         normalized_items: list[str] = []
         seen: set[str] = set()
@@ -91,7 +96,7 @@ class TaskRunner:
             with SessionLocal() as db:
                 account = self._resolve_account(db, payload)
                 self._ensure_account_profile_available(account)
-                supports_chat = payload.platform == Platform.BOSS
+                supports_chat = self._platform_supports_chat(payload.platform)
                 auto_send_chat = payload.auto_send_chat if supports_chat else False
                 chat_template = payload.chat_template if supports_chat else ""
                 normalized_company_blacklist = self._normalize_text_filters(payload.company_blacklist)
@@ -323,6 +328,8 @@ class TaskRunner:
                 self._run_qiancheng(task_run_id, payload, stop_event)
             elif payload.platform == Platform.BOSS:
                 self._run_boss(task_run_id, payload, stop_event)
+            elif payload.platform == Platform.YUPAO:
+                self._run_yupao(task_run_id, payload, stop_event)
             else:
                 self._run_liepin(task_run_id, payload, stop_event)
             final_status = TaskStatus.STOPPED if stop_event.is_set() else TaskStatus.COMPLETED
@@ -385,6 +392,9 @@ class TaskRunner:
                     return True
                 time.sleep(0.5)
             return False
+
+        def precheck_job(job_payload: dict) -> dict[str, str | bool]:
+            return self._match_filters(job_payload, payload)
 
         def process_job(job_payload: dict) -> None:
             if stop_event.is_set():
@@ -581,6 +591,9 @@ class TaskRunner:
                 time.sleep(0.5)
             return False
 
+        def precheck_job(job_payload: dict) -> dict[str, str | bool]:
+            return self._match_filters(job_payload, payload)
+
         def process_job(job_payload: dict) -> None:
             if stop_event.is_set():
                 return
@@ -776,6 +789,9 @@ class TaskRunner:
                 time.sleep(0.5)
             return False
 
+        def precheck_job(job_payload: dict) -> dict[str, str | bool]:
+            return self._match_filters(job_payload, payload)
+
         def process_job(job_payload: dict) -> None:
             if stop_event.is_set():
                 return
@@ -945,6 +961,221 @@ class TaskRunner:
         else:
             self._set_status(task_run_id, TaskStatus.RUNNING, "模拟执行猎聘搜索与继续聊流程")
             adapter.run_sync_mock(",".join(payload.search_terms), process_job, stop_event.is_set)
+
+    def _run_yupao(self, task_run_id: int, payload: StartTaskRequest, stop_event: threading.Event) -> None:
+        adapter = YupaoAdapter()
+        with self._lock:
+            worker = self._workers.get(payload.platform.value)
+            if worker and worker.task_run_id == task_run_id:
+                worker.force_stop = adapter.request_stop
+        with SessionLocal() as db:
+            account = self._resolve_account(db, payload)
+
+        def update_step(message: str) -> None:
+            with SessionLocal() as db:
+                task = db.get(TaskRun, task_run_id)
+                if not task:
+                    return
+                self._assign_current_step(task, message)
+                db.add(
+                    TaskLog(
+                        platform=payload.platform.value,
+                        task_run_id=task.id,
+                        event_type="task_progress",
+                        message=message,
+                    )
+                )
+                db.commit()
+            live_preview_service.update_status(
+                payload.platform,
+                task_run_id=task_run_id,
+                current_step=message,
+                message=message,
+            )
+
+        def wait_for_login_confirmation() -> bool:
+            while not stop_event.is_set():
+                worker_state = self._workers.get(payload.platform.value)
+                if worker_state and worker_state.login_confirm_event.is_set():
+                    worker_state.login_confirm_event.clear()
+                    return True
+                time.sleep(0.5)
+            return False
+
+        def precheck_job(job_payload: dict) -> dict[str, str | bool]:
+            return self._match_filters(job_payload, payload)
+
+        def process_job(job_payload: dict) -> None:
+            if stop_event.is_set():
+                return
+            with SessionLocal() as db:
+                task = db.get(TaskRun, task_run_id)
+                if not task:
+                    return
+                self._assign_current_step(task, f"处理中: {job_payload['title']}")
+                task.processed_count += 1
+
+                filter_result = self._match_filters(job_payload, payload)
+                already_delivered = bool(job_payload.get("already_delivered", False))
+                delivery_status = (
+                    DeliveryStatus.SKIPPED.value
+                    if not filter_result["matched"] or already_delivered
+                    else DeliveryStatus.DELIVERED.value
+                    if job_payload.get("delivery_success", False)
+                    else DeliveryStatus.FAILED.value
+                )
+                status_reason = (
+                    filter_result["reason"]
+                    if not filter_result["matched"]
+                    else job_payload.get("status_reason", "鱼泡沟通流程完成")
+                )
+
+                existing_job = db.scalar(
+                    select(Job).where(
+                        Job.platform == payload.platform.value,
+                        Job.platform_job_id == job_payload["platform_job_id"],
+                    )
+                )
+                if existing_job:
+                    existing_job.title = job_payload["title"]
+                    existing_job.company_name = job_payload["company_name"]
+                    existing_job.salary_text = job_payload["salary_text"]
+                    existing_job.salary_min = job_payload.get("salary_min")
+                    existing_job.salary_max = job_payload.get("salary_max")
+                    existing_job.city = job_payload.get("city", payload.cities[0] if payload.cities else "")
+                    existing_job.experience_text = job_payload.get("experience_text", "不限")
+                    existing_job.education_text = job_payload.get("education_text", "未标注")
+                    existing_job.description = job_payload.get("description", "")
+                    existing_job.detail_url = job_payload.get("detail_url", "")
+                    existing_job.tags = job_payload.get("tags", [])
+                    existing_job.latest_status = delivery_status
+                    existing_job.task_run_id = task.id
+                    job = existing_job
+                else:
+                    job = Job(
+                        platform=payload.platform.value,
+                        platform_job_id=job_payload["platform_job_id"],
+                        title=job_payload["title"],
+                        company_name=job_payload["company_name"],
+                        salary_text=job_payload.get("salary_text", "未标注"),
+                        salary_min=job_payload.get("salary_min"),
+                        salary_max=job_payload.get("salary_max"),
+                        city=job_payload.get("city", payload.cities[0] if payload.cities else ""),
+                        experience_text=job_payload.get("experience_text", "不限"),
+                        education_text=job_payload.get("education_text", "未标注"),
+                        description=job_payload.get("description", ""),
+                        detail_url=job_payload.get("detail_url", ""),
+                        tags=job_payload.get("tags", []),
+                        latest_status=delivery_status,
+                        task_run_id=task.id,
+                    )
+                    db.add(job)
+                    db.flush()
+
+                delivery = DeliveryRecord(
+                    job_id=job.id,
+                    task_run_id=task.id,
+                    account_id=task.account_id,
+                    platform=payload.platform.value,
+                    status=delivery_status,
+                    status_reason=status_reason,
+                    send_status=self._initial_chat_send_status(payload, job_payload, delivery_status),
+                    chat_hr_name=str(job_payload.get("recruiter_name", "") or ""),
+                    chat_sent=bool(job_payload.get("chat_sent", False)),
+                    chat_message=str(job_payload.get("chat_message", "") or ""),
+                )
+                db.add(delivery)
+                if not filter_result["matched"]:
+                    task.failed_count += 1
+                elif already_delivered:
+                    pass
+                elif job_payload.get("delivery_success", False):
+                    task.delivered_count += 1
+                else:
+                    task.failed_count += 1
+
+                db.add(
+                    TaskLog(
+                        platform=payload.platform.value,
+                        task_run_id=task.id,
+                        event_type="job_processed",
+                        message=(
+                            f" {job_payload.get('search_term', '')} | "
+                            f"{job.title} / {job.company_name} / {delivery.status} / {status_reason}"
+                        ),
+                        extra_json={
+                            "detail_url": job.detail_url,
+                            "platform_job_id": job.platform_job_id,
+                            "search_term": job_payload.get("search_term"),
+                            "reason": status_reason,
+                            "chat_sent": bool(job_payload.get("chat_sent", False)),
+                            "send_status": delivery.send_status,
+                        },
+                    )
+                )
+                db.commit()
+            time.sleep(1)
+
+        if settings.automation_mode == "playwright":
+            import asyncio
+
+            if sys.platform == "win32":
+                loop = asyncio.ProactorEventLoop()
+                try:
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(
+                        adapter.run_search_flow(
+                            payload.search_terms,
+                            account.profile_dir,
+                            process_job,
+                            stop_event.is_set,
+                            update_step,
+                            wait_for_login_confirmation,
+                            precheck_job,
+                            entry_url=payload.manual_entry_url if payload.use_manual_entry_url else settings.yupao_entry_url,
+                            task_run_id=task_run_id,
+                            headless=payload.headless_enabled,
+                            live_preview_enabled=payload.live_preview_enabled,
+                            live_preview_interval_ms=payload.live_preview_interval_ms,
+                            delivery_interval_seconds=payload.delivery_interval_seconds,
+                            max_deliveries_per_run=payload.max_deliveries_per_run,
+                            auto_send_chat=payload.auto_send_chat,
+                            use_chat_template=payload.use_chat_template,
+                            chat_message_template=payload.chat_template,
+                            enable_image_resume=payload.enable_image_resume,
+                            image_resume_path=payload.image_resume_path,
+                        )
+                    )
+                finally:
+                    loop.close()
+                    asyncio.set_event_loop(None)
+            else:
+                asyncio.run(
+                    adapter.run_search_flow(
+                        payload.search_terms,
+                        account.profile_dir,
+                        process_job,
+                        stop_event.is_set,
+                        update_step,
+                        wait_for_login_confirmation,
+                        precheck_job,
+                        entry_url=payload.manual_entry_url if payload.use_manual_entry_url else settings.yupao_entry_url,
+                        task_run_id=task_run_id,
+                        headless=payload.headless_enabled,
+                        live_preview_enabled=payload.live_preview_enabled,
+                        live_preview_interval_ms=payload.live_preview_interval_ms,
+                        delivery_interval_seconds=payload.delivery_interval_seconds,
+                        max_deliveries_per_run=payload.max_deliveries_per_run,
+                        auto_send_chat=payload.auto_send_chat,
+                        use_chat_template=payload.use_chat_template,
+                        chat_message_template=payload.chat_template,
+                        enable_image_resume=payload.enable_image_resume,
+                        image_resume_path=payload.image_resume_path,
+                    )
+                )
+        else:
+            self._set_status(task_run_id, TaskStatus.RUNNING, "模拟执行鱼泡列表与沟通流程")
+            adapter.run_sync_mock(payload.manual_entry_url or settings.yupao_entry_url, process_job, stop_event.is_set)
 
     def _run_boss(self, task_run_id: int, payload: StartTaskRequest, stop_event: threading.Event) -> None:
         adapter = BossAdapter()
@@ -1382,6 +1613,8 @@ class TaskRunner:
             return QianchengAdapter.normalize_salary(raw_salary_text)
         if platform == Platform.LIEPIN:
             return LiepinAdapter.normalize_salary(raw_salary_text)
+        if platform == Platform.YUPAO:
+            return YupaoAdapter.normalize_salary(raw_salary_text)
         return BossAdapter.normalize_salary(raw_salary_text)
 
     def _normalize_boss_activity_status(self, raw_status: str) -> str:

@@ -488,6 +488,8 @@ class AccountBrowserService:
     def _platform_entry_url(platform: Platform) -> str:
         if platform == Platform.LIEPIN:
             return settings.liepin_login_url
+        if platform == Platform.YUPAO:
+            return settings.yupao_login_url
         if platform == Platform.ZHILIAN:
             return settings.zhilian_entry_url
         if platform == Platform.QIANCHENG:

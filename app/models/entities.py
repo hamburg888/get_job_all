@@ -12,6 +12,7 @@ class Platform(StrEnum):
     BOSS = "boss"
     LIEPIN = "liepin"
     QIANCHENG = "qiancheng"
+    YUPAO = "yupao"
     ZHILIAN = "zhilian"
 
 
