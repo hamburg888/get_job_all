@@ -75,7 +75,9 @@ jobs:
       - name: Install frontend deps
         working-directory: fronted
         shell: pwsh
-        run: npm.cmd ci
+        run: |
+          # echarts-wordcloud@2 still peers echarts@5 while the app uses echarts@6
+          npm.cmd ci --legacy-peer-deps --no-audit --no-fund
 
       - name: Install Inno Setup
         shell: pwsh
