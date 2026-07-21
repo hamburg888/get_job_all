@@ -67,6 +67,44 @@ class TaskRunner:
         return platform in {Platform.BOSS, Platform.LIEPIN, Platform.YUPAO}
 
     @staticmethod
+    def _serialize_task_config(payload: StartTaskRequest) -> dict:
+        auto_send_chat = TaskRunner._derive_auto_send_chat(payload)
+        return {
+            "search_terms": list(payload.search_terms or []),
+            "use_manual_entry_url": payload.use_manual_entry_url,
+            "manual_entry_url": payload.manual_entry_url or "",
+            "keywords": list(payload.keywords or []),
+            "cities": list(payload.cities or []),
+            "enable_company_blacklist": payload.enable_company_blacklist,
+            "company_blacklist": list(payload.company_blacklist or []),
+            "enable_job_title_blacklist": payload.enable_job_title_blacklist,
+            "job_title_blacklist": list(payload.job_title_blacklist or []),
+            "salary_min": payload.salary_min,
+            "salary_max": payload.salary_max,
+            "cooldown_days": payload.cooldown_days,
+            "cross_account_dedupe_enabled": payload.cross_account_dedupe_enabled,
+            "dedupe_match_by_title": payload.dedupe_match_by_title,
+            "dedupe_match_by_company": payload.dedupe_match_by_company,
+            "headless_enabled": payload.headless_enabled,
+            "live_preview_enabled": payload.live_preview_enabled,
+            "delivery_interval_seconds": payload.delivery_interval_seconds,
+            "max_deliveries_per_run": payload.max_deliveries_per_run,
+            "auto_send_chat": auto_send_chat,
+            "use_chat_template": payload.use_chat_template,
+            "chat_template": payload.chat_template or "",
+            "enable_common_phrases": payload.enable_common_phrases,
+            "common_phrase_indexes": list(payload.common_phrase_indexes or []),
+            "enable_image_resume": payload.enable_image_resume,
+            "image_resume_path": payload.image_resume_path or "",
+            "auto_agree_wechat_card": payload.auto_agree_wechat_card,
+            "boss_first_greeting_only": payload.boss_first_greeting_only,
+            "enable_follow_up_reply": payload.enable_follow_up_reply,
+            "boss_active_statuses": list(payload.boss_active_statuses or []),
+            "remark": payload.remark or "",
+            "account_id": payload.account_id,
+        }
+
+    @staticmethod
     def _normalize_text_filters(values: list[str]) -> list[str]:
         normalized_items: list[str] = []
         seen: set[str] = set()
@@ -97,7 +135,8 @@ class TaskRunner:
                 account = self._resolve_account(db, payload)
                 self._ensure_account_profile_available(account)
                 supports_chat = self._platform_supports_chat(payload.platform)
-                auto_send_chat = payload.auto_send_chat if supports_chat else False
+                auto_send_chat = self._derive_auto_send_chat(payload)
+                payload.auto_send_chat = auto_send_chat
                 chat_template = payload.chat_template if supports_chat else ""
                 normalized_company_blacklist = self._normalize_text_filters(payload.company_blacklist)
                 payload.company_blacklist = normalized_company_blacklist
@@ -143,6 +182,7 @@ class TaskRunner:
                     processed_count=0,
                     delivered_count=0,
                     failed_count=0,
+                    config_json=self._serialize_task_config(payload),
                 )
                 db.add(task)
                 db.flush()
@@ -428,15 +468,18 @@ class TaskRunner:
                 if existing_job:
                     existing_job.title = job_payload["title"]
                     existing_job.company_name = job_payload["company_name"]
-                    existing_job.salary_text = job_payload["salary_text"]
-                    existing_job.salary_min = job_payload.get("salary_min")
-                    existing_job.salary_max = job_payload.get("salary_max")
-                    existing_job.city = job_payload.get("city", payload.cities[0] if payload.cities else "")
-                    existing_job.experience_text = job_payload.get("experience_text", "不限")
-                    existing_job.education_text = job_payload.get("education_text", "未标注")
-                    existing_job.description = job_payload["description"]
-                    existing_job.detail_url = job_payload["detail_url"]
-                    existing_job.tags = job_payload.get("tags", [])
+                    if job_payload.get("salary_text"): existing_job.salary_text = job_payload.get("salary_text", "")
+                    if job_payload.get("salary_min") is not None: existing_job.salary_min = job_payload.get("salary_min")
+                    if job_payload.get("salary_max") is not None: existing_job.salary_max = job_payload.get("salary_max")
+                    _city_val = str(job_payload.get("city") or "")
+                    if _city_val and _city_val != "未标注": existing_job.city = _city_val
+                    _exp_val = str(job_payload.get("experience_text") or "")
+                    if _exp_val and _exp_val != "不限": existing_job.experience_text = _exp_val
+                    _edu_val = str(job_payload.get("education_text") or "")
+                    if _edu_val and _edu_val != "未标注": existing_job.education_text = _edu_val
+                    if job_payload.get("description"): existing_job.description = job_payload["description"]
+                    if job_payload.get("detail_url"): existing_job.detail_url = job_payload["detail_url"]
+                    if job_payload.get("tags"): existing_job.tags = job_payload.get("tags", [])
                     existing_job.latest_status = delivery_status
                     existing_job.task_run_id = task.id
                     job = existing_job
@@ -626,15 +669,18 @@ class TaskRunner:
                 if existing_job:
                     existing_job.title = job_payload["title"]
                     existing_job.company_name = job_payload["company_name"]
-                    existing_job.salary_text = job_payload["salary_text"]
-                    existing_job.salary_min = job_payload.get("salary_min")
-                    existing_job.salary_max = job_payload.get("salary_max")
-                    existing_job.city = job_payload.get("city", payload.cities[0] if payload.cities else "")
-                    existing_job.experience_text = job_payload.get("experience_text", "不限")
-                    existing_job.education_text = job_payload.get("education_text", "未标注")
-                    existing_job.description = job_payload["description"]
-                    existing_job.detail_url = job_payload["detail_url"]
-                    existing_job.tags = job_payload.get("tags", [])
+                    if job_payload.get("salary_text"): existing_job.salary_text = job_payload.get("salary_text", "")
+                    if job_payload.get("salary_min") is not None: existing_job.salary_min = job_payload.get("salary_min")
+                    if job_payload.get("salary_max") is not None: existing_job.salary_max = job_payload.get("salary_max")
+                    _city_val = str(job_payload.get("city") or "")
+                    if _city_val and _city_val != "未标注": existing_job.city = _city_val
+                    _exp_val = str(job_payload.get("experience_text") or "")
+                    if _exp_val and _exp_val != "不限": existing_job.experience_text = _exp_val
+                    _edu_val = str(job_payload.get("education_text") or "")
+                    if _edu_val and _edu_val != "未标注": existing_job.education_text = _edu_val
+                    if job_payload.get("description"): existing_job.description = job_payload["description"]
+                    if job_payload.get("detail_url"): existing_job.detail_url = job_payload["detail_url"]
+                    if job_payload.get("tags"): existing_job.tags = job_payload.get("tags", [])
                     existing_job.latest_status = delivery_status
                     existing_job.task_run_id = task.id
                     job = existing_job
@@ -826,15 +872,18 @@ class TaskRunner:
                 if existing_job:
                     existing_job.title = job_payload["title"]
                     existing_job.company_name = job_payload["company_name"]
-                    existing_job.salary_text = job_payload["salary_text"]
-                    existing_job.salary_min = job_payload.get("salary_min")
-                    existing_job.salary_max = job_payload.get("salary_max")
-                    existing_job.city = job_payload.get("city", payload.cities[0] if payload.cities else "")
-                    existing_job.experience_text = job_payload.get("experience_text", "不限")
-                    existing_job.education_text = job_payload.get("education_text", "未标注")
-                    existing_job.description = job_payload.get("description", "")
-                    existing_job.detail_url = job_payload.get("detail_url", "")
-                    existing_job.tags = job_payload.get("tags", [])
+                    if job_payload.get("salary_text"): existing_job.salary_text = job_payload.get("salary_text", "")
+                    if job_payload.get("salary_min") is not None: existing_job.salary_min = job_payload.get("salary_min")
+                    if job_payload.get("salary_max") is not None: existing_job.salary_max = job_payload.get("salary_max")
+                    _city_val = str(job_payload.get("city") or "")
+                    if _city_val and _city_val != "未标注": existing_job.city = _city_val
+                    _exp_val = str(job_payload.get("experience_text") or "")
+                    if _exp_val and _exp_val != "不限": existing_job.experience_text = _exp_val
+                    _edu_val = str(job_payload.get("education_text") or "")
+                    if _edu_val and _edu_val != "未标注": existing_job.education_text = _edu_val
+                    if job_payload.get("description"): existing_job.description = job_payload.get("description", "")
+                    if job_payload.get("detail_url"): existing_job.detail_url = job_payload.get("detail_url", "")
+                    if job_payload.get("tags"): existing_job.tags = job_payload.get("tags", [])
                     existing_job.latest_status = delivery_status
                     existing_job.task_run_id = task.id
                     job = existing_job
@@ -1039,15 +1088,18 @@ class TaskRunner:
                 if existing_job:
                     existing_job.title = job_payload["title"]
                     existing_job.company_name = job_payload["company_name"]
-                    existing_job.salary_text = job_payload["salary_text"]
-                    existing_job.salary_min = job_payload.get("salary_min")
-                    existing_job.salary_max = job_payload.get("salary_max")
-                    existing_job.city = job_payload.get("city", payload.cities[0] if payload.cities else "")
-                    existing_job.experience_text = job_payload.get("experience_text", "不限")
-                    existing_job.education_text = job_payload.get("education_text", "未标注")
-                    existing_job.description = job_payload.get("description", "")
-                    existing_job.detail_url = job_payload.get("detail_url", "")
-                    existing_job.tags = job_payload.get("tags", [])
+                    if job_payload.get("salary_text"): existing_job.salary_text = job_payload.get("salary_text", "")
+                    if job_payload.get("salary_min") is not None: existing_job.salary_min = job_payload.get("salary_min")
+                    if job_payload.get("salary_max") is not None: existing_job.salary_max = job_payload.get("salary_max")
+                    _city_val = str(job_payload.get("city") or "")
+                    if _city_val and _city_val != "未标注": existing_job.city = _city_val
+                    _exp_val = str(job_payload.get("experience_text") or "")
+                    if _exp_val and _exp_val != "不限": existing_job.experience_text = _exp_val
+                    _edu_val = str(job_payload.get("education_text") or "")
+                    if _edu_val and _edu_val != "未标注": existing_job.education_text = _edu_val
+                    if job_payload.get("description"): existing_job.description = job_payload.get("description", "")
+                    if job_payload.get("detail_url"): existing_job.detail_url = job_payload.get("detail_url", "")
+                    if job_payload.get("tags"): existing_job.tags = job_payload.get("tags", [])
                     existing_job.latest_status = delivery_status
                     existing_job.task_run_id = task.id
                     job = existing_job
@@ -1247,15 +1299,18 @@ class TaskRunner:
                 if existing_job:
                     existing_job.title = job_payload["title"]
                     existing_job.company_name = job_payload["company_name"]
-                    existing_job.salary_text = job_payload["salary_text"]
-                    existing_job.salary_min = job_payload.get("salary_min")
-                    existing_job.salary_max = job_payload.get("salary_max")
-                    existing_job.city = job_payload.get("city", "")
-                    existing_job.experience_text = job_payload.get("experience_text", "不限")
-                    existing_job.education_text = job_payload.get("education_text", "未标注")
-                    existing_job.description = job_payload.get("description", "")
-                    existing_job.detail_url = job_payload.get("detail_url", "")
-                    existing_job.tags = job_payload.get("tags", [])
+                    if job_payload.get("salary_text"): existing_job.salary_text = job_payload.get("salary_text", "")
+                    if job_payload.get("salary_min") is not None: existing_job.salary_min = job_payload.get("salary_min")
+                    if job_payload.get("salary_max") is not None: existing_job.salary_max = job_payload.get("salary_max")
+                    _city_val = str(job_payload.get("city") or "")
+                    if _city_val and _city_val != "未标注": existing_job.city = _city_val
+                    _exp_val = str(job_payload.get("experience_text") or "")
+                    if _exp_val and _exp_val != "不限": existing_job.experience_text = _exp_val
+                    _edu_val = str(job_payload.get("education_text") or "")
+                    if _edu_val and _edu_val != "未标注": existing_job.education_text = _edu_val
+                    if job_payload.get("description"): existing_job.description = job_payload.get("description", "")
+                    if job_payload.get("detail_url"): existing_job.detail_url = job_payload.get("detail_url", "")
+                    if job_payload.get("tags"): existing_job.tags = job_payload.get("tags", [])
                     existing_job.latest_status = delivery_status
                     existing_job.task_run_id = task.id
                     job = existing_job
@@ -1342,47 +1397,16 @@ class TaskRunner:
                     return
 
                 if event_type == "chat_delivery_updated":
-                    delivery_stmt = (
-                        select(DeliveryRecord, Job)
-                        .join(Job, DeliveryRecord.job_id == Job.id)
-                        .where(
-                            DeliveryRecord.task_run_id == task.id,
-                            DeliveryRecord.platform == payload.platform.value,
-                        )
-                        .order_by(desc(DeliveryRecord.id))
+                    delivery = self._find_chat_delivery(
+                        db,
+                        task.id,
+                        payload.platform.value,
+                        platform_job_id=platform_job_id,
+                        job_title=job_title,
+                        company_name=company_name,
+                        hr_name=hr_name,
+                        weak_match_key=weak_match_key,
                     )
-                    if platform_job_id:
-                        delivery_stmt = delivery_stmt.where(Job.platform_job_id == platform_job_id)
-                    elif job_title or company_name or hr_name:
-                        if job_title:
-                            delivery_stmt = delivery_stmt.where(Job.title == job_title)
-                        if company_name:
-                            delivery_stmt = delivery_stmt.where(Job.company_name == company_name)
-                        if hr_name:
-                            delivery_stmt = delivery_stmt.where(DeliveryRecord.chat_hr_name == hr_name)
-                    delivery_row = db.execute(delivery_stmt.limit(10)).first()
-                    delivery = None
-                    if delivery_row:
-                        delivery = delivery_row[0]
-                    elif weak_match_key:
-                        fallback_stmt = (
-                            select(DeliveryRecord, Job)
-                            .join(Job, DeliveryRecord.job_id == Job.id)
-                            .where(
-                                DeliveryRecord.task_run_id == task.id,
-                                DeliveryRecord.platform == payload.platform.value,
-                            )
-                            .order_by(desc(DeliveryRecord.id))
-                        )
-                        for candidate_delivery, candidate_job in db.execute(fallback_stmt):
-                            candidate_key = self._normalize_chat_match_key(
-                                candidate_job.company_name,
-                                candidate_job.title,
-                                candidate_delivery.chat_hr_name or hr_name,
-                            )
-                            if candidate_key and candidate_key == weak_match_key:
-                                delivery = candidate_delivery
-                                break
                     if delivery:
                         resolved_send_status = send_status or (
                             ChatSendStatus.SENT.value if chat_sent else ChatSendStatus.FAILED.value
@@ -1506,6 +1530,10 @@ class TaskRunner:
         if company_blacklist_result is not None:
             return company_blacklist_result
 
+        job_title_blacklist_result = self._match_job_title_blacklist(job_payload, payload)
+        if job_title_blacklist_result is not None:
+            return job_title_blacklist_result
+
         if payload.keywords:
             if payload.platform == Platform.QIANCHENG:
                 haystack = str(job_payload.get("title", "") or "").lower()
@@ -1553,6 +1581,24 @@ class TaskRunner:
                 }
         return None
 
+    def _match_job_title_blacklist(
+        self, job_payload: dict, payload: StartTaskRequest
+    ) -> dict[str, str | bool] | None:
+        if not payload.enable_job_title_blacklist:
+            return None
+
+        raw_title = str(job_payload.get("title", "") or "").strip()
+        if not raw_title:
+            return None
+        normalized_title = " ".join(raw_title.split()).lower()
+        for blacklist_item in self._normalize_text_filters(payload.job_title_blacklist):
+            if blacklist_item.lower() in normalized_title:
+                return {
+                    "matched": False,
+                    "reason": f"岗位标题黑名单命中: {raw_title}（关键词: {blacklist_item}）",
+                }
+        return None
+
     def _match_salary_range(self, job_payload: dict, payload: StartTaskRequest) -> dict[str, str | bool] | None:
         expected_min = payload.salary_min
         expected_max = payload.salary_max
@@ -1578,6 +1624,10 @@ class TaskRunner:
 
         # 上下限都按硬条件处理，避免 5-20K 仍投递 25K+ 岗位。
         if compare_min is not None and job_min is not None and job_min < compare_min:
+            if payload.salary_floor_flexible_enabled and payload.salary_floor_required_max is not None:
+                floor_required_max = self._convert_expected_salary_bound(payload.salary_floor_required_max, is_daily_salary)
+                if floor_required_max is not None and job_max is not None and job_max >= floor_required_max:
+                    return None
             return {
                 "matched": False,
                 "reason": f"薪资下限过低: {raw_salary_text or f'{job_min:g}'} < {self._format_expected_salary(compare_min, is_daily_salary)}",
@@ -1648,13 +1698,28 @@ class TaskRunner:
             return "本月活跃"
         return status
 
+
+    @staticmethod
+    def _derive_auto_send_chat(payload: StartTaskRequest) -> bool:
+        if not TaskRunner._platform_supports_chat(payload.platform):
+            return False
+        if payload.platform == Platform.BOSS:
+            return bool(
+                payload.use_chat_template
+                or payload.enable_common_phrases
+                or payload.enable_image_resume
+                or payload.auto_agree_wechat_card
+                or payload.enable_follow_up_reply
+            )
+        return bool(payload.auto_send_chat)
+
     def _initial_chat_send_status(self, payload: StartTaskRequest, job_payload: dict, delivery_status: str) -> str:
         if delivery_status != DeliveryStatus.DELIVERED.value:
             return ChatSendStatus.SKIPPED.value
         existing_send_status = str(job_payload.get("send_status", "") or "").strip()
         if existing_send_status:
             return existing_send_status
-        if not payload.auto_send_chat:
+        if not self._derive_auto_send_chat(payload):
             return ChatSendStatus.SKIPPED.value
         if bool(job_payload.get("chat_sent", False)):
             return ChatSendStatus.SENT.value
@@ -1667,6 +1732,101 @@ class TaskRunner:
         if not any(normalized):
             return ""
         return " | ".join(normalized)
+
+
+    def _find_chat_delivery(
+        self,
+        db,
+        task_id: int,
+        platform_value: str,
+        *,
+        platform_job_id: str = "",
+        job_title: str = "",
+        company_name: str = "",
+        hr_name: str = "",
+        weak_match_key: str = "",
+    ) -> DeliveryRecord | None:
+        base_filters = [
+            DeliveryRecord.task_run_id == task_id,
+            DeliveryRecord.platform == platform_value,
+        ]
+
+        # Strategy 1: exact platform_job_id match, prefer PENDING send_status
+        if platform_job_id:
+            stmt = (
+                select(DeliveryRecord)
+                .join(Job, DeliveryRecord.job_id == Job.id)
+                .where(*base_filters, Job.platform_job_id == platform_job_id)
+                .order_by(desc(DeliveryRecord.id))
+            )
+            rows = list(db.execute(stmt))
+            if rows:
+                for row in rows:
+                    delivery = row[0]
+                    if delivery.send_status in (ChatSendStatus.PENDING.value, ChatSendStatus.SKIPPED.value):
+                        return delivery
+                return rows[0][0]
+
+        # Strategy 2: company_name contains match (case-insensitive, bidirectional)
+        normalized_company = " ".join((company_name or "").strip().lower().split())
+        normalized_title = " ".join((job_title or "").strip().lower().split())
+        if normalized_company or normalized_title:
+            stmt = (
+                select(DeliveryRecord, Job)
+                .join(Job, DeliveryRecord.job_id == Job.id)
+                .where(*base_filters)
+                .order_by(desc(DeliveryRecord.id))
+            )
+            pending_candidates: list = []
+            other_candidates: list = []
+            for delivery, job in db.execute(stmt):
+                existing_company = " ".join((job.company_name or "").strip().lower().split())
+                existing_title = " ".join((job.title or "").strip().lower().split())
+                matched = False
+                if normalized_company and existing_company:
+                    if normalized_company in existing_company or existing_company in normalized_company:
+                        matched = True
+                if not matched and normalized_title and existing_title:
+                    if normalized_title in existing_title or existing_title in normalized_title:
+                        matched = True
+                if not matched:
+                    continue
+                if delivery.send_status in (ChatSendStatus.PENDING.value, ChatSendStatus.SKIPPED.value):
+                    pending_candidates.append(delivery)
+                else:
+                    other_candidates.append(delivery)
+            if pending_candidates:
+                return pending_candidates[0]
+            if other_candidates:
+                return other_candidates[0]
+
+        # Strategy 3: weak_match_key fallback (exact normalized 3-field match)
+        if weak_match_key:
+            stmt = (
+                select(DeliveryRecord, Job)
+                .join(Job, DeliveryRecord.job_id == Job.id)
+                .where(*base_filters)
+                .order_by(desc(DeliveryRecord.id))
+            )
+            pending_candidates: list = []
+            other_candidates: list = []
+            for candidate_delivery, candidate_job in db.execute(stmt):
+                candidate_key = self._normalize_chat_match_key(
+                    candidate_job.company_name,
+                    candidate_job.title,
+                    candidate_delivery.chat_hr_name or hr_name,
+                )
+                if candidate_key and candidate_key == weak_match_key:
+                    if candidate_delivery.send_status in (ChatSendStatus.PENDING.value, ChatSendStatus.SKIPPED.value):
+                        pending_candidates.append(candidate_delivery)
+                    else:
+                        other_candidates.append(candidate_delivery)
+            if pending_candidates:
+                return pending_candidates[0]
+            if other_candidates:
+                return other_candidates[0]
+
+        return None
 
     def _match_cross_account_dedupe(self, job_payload: dict, payload: StartTaskRequest) -> dict[str, str | bool] | None:
         if not payload.cross_account_dedupe_enabled or not payload.account_id:

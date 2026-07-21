@@ -33,6 +33,11 @@ from app.schemas.common import (
     StatsOut,
     StopTaskRequest,
     TaskStatusResponse,
+    LLMConfigOut,
+    LLMConfigUpdate,
+    TaskRunOut,
+    AIAdviseRequest,
+    AIAdviseOut,
     UploadImageRequest,
     UploadedFileOut,
 )
@@ -48,6 +53,9 @@ from app.services.resume_sync_service import (
     update_master_resume,
 )
 from app.services.task_runner import task_runner
+from app.services.settings_service import get_llm_config, test_llm_config, update_llm_config
+from app.services.task_run_service import list_task_runs
+from app.services.ai_advisor_service import build_ai_advice
 
 router = APIRouter()
 
@@ -208,8 +216,16 @@ def dashboard_jobs(
 
 
 @router.get("/dashboard/deliveries/{platform}", response_model=PaginatedDeliveriesOut)
-def dashboard_deliveries(platform: Platform, page: int = 1, page_size: int = 10, db: Session = Depends(get_db)) -> dict:
-    return list_deliveries(db, platform, page, page_size)
+
+
+def dashboard_deliveries(
+    platform: Platform,
+    page: int = 1,
+    page_size: int = 10,
+    filters: DashboardFilters = Depends(_dashboard_filters),
+    db: Session = Depends(get_db),
+) -> dict:
+    return list_deliveries(db, platform, page, page_size, filters)
 
 
 @router.get("/dashboard/logs/{platform}", response_model=list[LogOut])
@@ -256,9 +272,9 @@ def start_task(payload: StartTaskRequest) -> TaskStatusResponse:
     try:
         return task_runner.start(payload)
     except RuntimeError as exc:
-        if str(exc) == "该账号浏览器配置窗口正在占用同一浏览器配置目录，请先关闭浏览器配置后再启动任务。":
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        raise
+        raise HTTPException(status_code=409, detail=_safe_error_message(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=_safe_error_message(exc)) from exc
 
 
 @router.post("/tasks/stop", response_model=TaskStatusResponse)
@@ -269,3 +285,34 @@ def stop_task(payload: StopTaskRequest) -> TaskStatusResponse:
 @router.post("/tasks/confirm-login", response_model=TaskStatusResponse)
 def confirm_login(payload: ConfirmLoginRequest) -> TaskStatusResponse:
     return task_runner.confirm_login(payload.platform)
+
+
+
+@router.get("/settings/llm", response_model=LLMConfigOut)
+def get_llm_settings(db: Session = Depends(get_db)) -> dict:
+    return get_llm_config(db)
+
+
+@router.put("/settings/llm", response_model=LLMConfigOut)
+def update_llm_settings(payload: LLMConfigUpdate, db: Session = Depends(get_db)) -> dict:
+    return update_llm_config(db, payload)
+
+
+@router.post("/settings/llm/test")
+def test_llm_settings(db: Session = Depends(get_db)) -> dict:
+    return test_llm_config(db)
+
+
+@router.get("/tasks/runs", response_model=list[TaskRunOut])
+def task_runs(platform: str | None = None, limit: int = 50, db: Session = Depends(get_db)) -> list[dict]:
+    return list_task_runs(db, platform=platform, limit=limit)
+
+
+@router.get("/runs/{platform}", response_model=list[TaskRunOut])
+def task_runs_by_platform(platform: str, limit: int = 50, db: Session = Depends(get_db)) -> list[dict]:
+    return list_task_runs(db, platform=platform, limit=limit)
+
+
+@router.post("/ai/advise", response_model=AIAdviseOut)
+def ai_advise(payload: AIAdviseRequest, db: Session = Depends(get_db)) -> dict:
+    return build_ai_advice(db, payload)

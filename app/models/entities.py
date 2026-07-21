@@ -56,6 +56,8 @@ class RuleConfig(Base):
     city: Mapped[str] = mapped_column(String(60), default="")
     enable_company_blacklist: Mapped[bool] = mapped_column(Boolean, default=False)
     company_blacklist: Mapped[str] = mapped_column(Text, default="")
+    enable_job_title_blacklist: Mapped[bool] = mapped_column(Boolean, default=False)
+    job_title_blacklist: Mapped[str] = mapped_column(Text, default="")
     salary_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
     salary_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cooldown_days: Mapped[int] = mapped_column(Integer, default=7)
@@ -87,6 +89,7 @@ class TaskRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
     current_step_started_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    config_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
     account: Mapped["Account | None"] = relationship(back_populates="task_runs")
     jobs: Mapped[list["Job"]] = relationship(back_populates="task_run")
@@ -241,3 +244,13 @@ class ResumeSyncTarget(Base):
 
     sync_run: Mapped["ResumeSyncRun"] = relationship(back_populates="targets")
     target_account: Mapped["Account | None"] = relationship()
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    category: Mapped[str] = mapped_column(String(40), default="general")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=local_now, onupdate=local_now)

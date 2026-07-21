@@ -1,0 +1,137 @@
+name: Release Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the leading v (example: 0.1.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    name: Build Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $raw = if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.version }}") {
+            "${{ inputs.version }}"
+          } elseif ($env:GITHUB_REF_TYPE -eq "tag") {
+            $env:GITHUB_REF_NAME
+          } else {
+            "0.0.0-dev"
+          }
+          $version = $raw.Trim()
+          if ($version.StartsWith("v") -or $version.StartsWith("V")) {
+            $version = $version.Substring(1)
+          }
+          if (-not $version) {
+            throw "Unable to resolve release version"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Resolved version: $version"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-desktop.txt
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: fronted/package-lock.json
+
+      - name: Create virtualenv and install Python deps
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
+
+      - name: Install frontend deps
+        working-directory: fronted
+        shell: pwsh
+        run: npm.cmd ci
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build desktop bundle
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe not found after installing Inno Setup"
+          }
+          .\build_desktop_bundle.ps1 `
+            -PythonExe (Join-Path $PWD ".venv\Scripts\python.exe") `
+            -InnoSetupCompiler $iscc `
+            -AppVersion "${{ steps.version.outputs.version }}"
+
+      - name: Collect artifacts
+        id: artifacts
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path dist_installer -Filter *.exe -File | Select-Object -First 1
+          if (-not $installer) {
+            throw "Installer exe not found in dist_installer"
+          }
+          $zipPath = Join-Path $PWD "dist_installer\JobHelpDesktop-windows-x64-v${{ steps.version.outputs.version }}.zip"
+          if (Test-Path $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force
+          }
+          Compress-Archive -Path (Join-Path $PWD "dist_desktop\JobHelpDesktop\*") -DestinationPath $zipPath -Force
+          "installer=$($installer.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "portable=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Installer: $($installer.FullName)"
+          Write-Host "Portable zip: $zipPath"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: JobHelpDesktop-windows-x64-v${{ steps.version.outputs.version }}
+          path: |
+            ${{ steps.artifacts.outputs.installer }}
+            ${{ steps.artifacts.outputs.portable }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: JobHelp ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.artifacts.outputs.installer }}
+            ${{ steps.artifacts.outputs.portable }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none">
+  <defs>
+    <linearGradient id="job-help-bg" x1="36" y1="28" x2="220" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3E86FF" />
+      <stop offset="1" stop-color="#1F5FD6" />
+    </linearGradient>
+    <linearGradient id="job-help-gloss" x1="72" y1="44" x2="180" y2="178" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.44" />
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0" />
+    </linearGradient>
+  </defs>
+  <rect x="20" y="20" width="216" height="216" rx="52" fill="url(#job-help-bg)" />
+  <rect x="20" y="20" width="216" height="216" rx="52" stroke="rgba(255,255,255,0.22)" stroke-width="2" />
+  <path
+    d="M74 74C74 60.7452 84.7452 50 98 50H166C179.255 50 190 60.7452 190 74V114C190 127.255 179.255 138 166 138H146V170C146 184.359 128.641 191.551 118.485 181.515L94.971 158.284C90.4708 153.839 84.4052 151.345 78.08 151.345H74V74Z"
+    fill="url(#job-help-gloss)"
+  />
+  <path
+    d="M86 168L128 126L144 142L182 104"
+    stroke="#FFFFFF"
+    stroke-width="20"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M148 104H182V138"
+    stroke="#FFFFFF"
+    stroke-width="20"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

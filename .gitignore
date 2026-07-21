@@ -34,3 +34,15 @@ htmlcov/
 .vscode/
 preview_frames/
 uploads/
+dist_installer/
+runtime_logs/
+*.tmp
+.codex_write_probe.tmp
+
+# Frontend (source is tracked; heavy build artifacts are not)
+fronted/node_modules/
+fronted/dist/
+fronted/dist-ssr/
+fronted/.vite/
+fronted/coverage/
+fronted/*.local

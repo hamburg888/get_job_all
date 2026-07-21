@@ -273,18 +273,33 @@ def list_jobs(db: Session, platform: Platform, page: int = 1, page_size: int = 1
     }
 
 
-def list_deliveries(db: Session, platform: Platform, page: int = 1, page_size: int = 10) -> dict:
+def list_deliveries(db: Session, platform: Platform, page: int = 1, page_size: int = 10, filters: DashboardFilters | None = None) -> dict:
     page = max(1, page)
     page_size = max(1, min(page_size, 100))
-    total = db.scalar(select(func.count(DeliveryRecord.id)).where(DeliveryRecord.platform == platform.value)) or 0
-    stmt = (
+    normalized_filters = filters or DashboardFilters()
+    date_start, date_end = _parse_filter_dates(normalized_filters)
+
+    def _apply_delivery_filters(stmt):
+        if normalized_filters.account_id is not None:
+            stmt = stmt.where(DeliveryRecord.account_id == normalized_filters.account_id)
+        if normalized_filters.statuses:
+            stmt = stmt.where(DeliveryRecord.status.in_(normalized_filters.statuses))
+        if normalized_filters.send_statuses:
+            stmt = stmt.where(DeliveryRecord.send_status.in_(normalized_filters.send_statuses))
+        if date_start is not None:
+            stmt = stmt.where(DeliveryRecord.created_at >= date_start)
+        if date_end is not None:
+            stmt = stmt.where(DeliveryRecord.created_at < date_end)
+        return stmt
+
+    base_stmt = _apply_delivery_filters(select(DeliveryRecord).where(DeliveryRecord.platform == platform.value))
+    total = db.scalar(select(func.count()).select_from(base_stmt.subquery())) or 0
+    stmt = _apply_delivery_filters(
         select(DeliveryRecord, Account)
         .join(Account, DeliveryRecord.account_id == Account.id, isouter=True)
         .where(DeliveryRecord.platform == platform.value)
         .order_by(desc(DeliveryRecord.created_at))
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )
+    ).offset((page - 1) * page_size).limit(page_size)
     return {
         "items": [
             {

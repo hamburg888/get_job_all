@@ -1,11 +1,13 @@
 param(
-    [string]$FrontendProjectPath = (Join-Path $PSScriptRoot '..\..\Front\job_help'),
+    # 前端工程已迁入本仓库 fronted 目录（拼写同实际目录名），保持可被参数覆盖
+    [string]$FrontendProjectPath = (Join-Path $PSScriptRoot 'fronted'),
     [string]$EmbeddedFrontendPath = (Join-Path $PSScriptRoot 'frontend_dist'),
     [string]$DesktopAssetsPath = (Join-Path $PSScriptRoot 'desktop_assets'),
     [string]$PythonExe = (Join-Path $PSScriptRoot '.venv\Scripts\python.exe'),
     [switch]$SkipPyInstaller,
     [switch]$SkipInstaller,
-    [string]$InnoSetupCompiler = ''
+    [string]$InnoSetupCompiler = '',
+    [string]$AppVersion = '0.1.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -159,8 +161,9 @@ if (Test-Path $installerOutput) {
     }
 }
 
-$appVersion = '0.1.0'
+$appVersion = if ($AppVersion) { $AppVersion.TrimStart('v', 'V') } else { '0.1.0' }
 
+Write-Host "==> 应用版本: $appVersion"
 Write-Host "==> 开始生成安装包"
 & $InnoSetupCompiler `
     "/DMyAppVersion=$appVersion" `

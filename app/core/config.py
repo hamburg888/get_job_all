@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     bootstrap_demo_data_enabled: bool = False
     automation_mode: str = "playwright"
     cors_origins: list[str] = ["http://127.0.0.1:5173", "http://localhost:5173"]
+    # Matches http(s)://localhost, 127.0.0.1 or [::1] on any port so the
+    # frontend keeps working even if Vite falls back to another dev port or is
+    # reached via localhost vs 127.0.0.1. Set to empty/null via .env to disable.
+    cors_origin_regex: str | None = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
     log_level: str = "INFO"
     log_root: str = Field(default_factory=_default_log_root)
     liepin_entry_url: str = "https://www.liepin.com/zhaopin/"

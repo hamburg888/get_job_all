@@ -191,7 +191,7 @@ class BossAdapter:
         search_terms: list[str],
         keywords: list[str],
         cities: list[str],
-        auto_send_chat: bool,
+        auto_send_chat: bool,  # 兼容旧参数；实际是否聊天由下方 chat_enabled 子功能推导
         use_chat_template: bool,
         chat_message_template: str,
         enable_common_phrases: bool,
@@ -215,6 +215,17 @@ class BossAdapter:
         live_preview_enabled: bool = False,
         live_preview_interval_ms: int = 1000,
     ) -> None:
+        # 自动聊天总开关由子功能推导：只要任一聊天动作开启，就启动聊天协程
+        chat_enabled = bool(
+            use_chat_template
+            or enable_common_phrases
+            or enable_image_resume
+            or auto_agree_wechat_card
+            or enable_follow_up_reply
+        )
+
+        _ = auto_send_chat  # retained for call-site compatibility
+
         from playwright.async_api import async_playwright
 
         jobs_url = (jobs_entry_url or settings.boss_jobs_url).strip() or settings.boss_jobs_url
@@ -315,6 +326,7 @@ class BossAdapter:
                             if status_callback:
                                 status_callback(f"Boss 正在处理岗位: {card.get('title') or '未知岗位'}")
 
+                            job_payload = None
                             try:
                                 preview_ref["page"] = jobs_page
                                 job_payload = await self._open_job_and_extract(jobs_page, card)
@@ -340,12 +352,12 @@ class BossAdapter:
                                 job_payload["delivery_success"] = click_result["success"]
                                 job_payload["status_reason"] = click_result["reason"]
 
-                                if click_result["success"] and auto_send_chat:
+                                if click_result["success"] and chat_enabled:
                                     await pending_chat_jobs.put(dict(job_payload))
                                     if status_callback:
                                         status_callback(f"Boss 已发起沟通并加入聊天队列: {job_payload['title']}")
                                 elif click_result["success"] and status_callback:
-                                    status_callback(f"Boss 已发起沟通: {job_payload['title']}，未开启自动聊天")
+                                    status_callback(f"Boss 已发起沟通: {job_payload['title']}，未启用任何聊天子功能")
 
                                 if job_callback:
                                     job_callback(job_payload)
@@ -371,6 +383,33 @@ class BossAdapter:
                                     status_callback(
                                         f"Boss 跳过当前岗位（页面弹层或点击异常）: {card.get('title') or '未知岗位'} / {exc}"
                                     )
+                                # still record the job so it appears in delivery history
+                                if job_callback:
+                                    if job_payload is None:
+                                        job_payload = {
+                                            "platform_job_id": card.get("platform_job_id") or "",
+                                            "title": card.get("raw_title") or card.get("title") or "未知岗位",
+                                            "company_name": card.get("company") or "未知公司",
+                                            "salary_text": card.get("salary_text", "") or "",
+                                            "salary_min": None,
+                                            "salary_max": None,
+                                            "city": card.get("city", ""),
+                                            "experience_text": "不限",
+                                            "education_text": "未标注",
+                                            "description": "",
+                                            "detail_url": card.get("href") or "",
+                                            "tags": card.get("job_tags") or [],
+                                            "search_term": "、".join(search_terms) if search_terms else "当前列表",
+                                            "matched": False,
+                                        }
+                                    job_payload["delivery_success"] = False
+                                    job_payload["status_reason"] = f"页面异常: {exc}"
+                                    job_payload["chat_sent"] = False
+                                    job_payload["chat_message"] = ""
+                                    try:
+                                        job_callback(job_payload)
+                                    except Exception:  # noqa: BLE001
+                                        logger.warning("Boss job_callback failed in except handler", exc_info=True)
                                 await self._dismiss_greet_boss_dialog(jobs_page, max_rounds=6)
                                 await jobs_page.wait_for_timeout(1000)
                                 continue
@@ -403,7 +442,7 @@ class BossAdapter:
                         delivery_finished=delivery_finished,
                     )
 
-                if auto_send_chat:
+                if chat_enabled:
                     chat_task = asyncio.create_task(chat_worker())
                 await delivery_worker()
                 delivery_finished.set()
@@ -412,7 +451,7 @@ class BossAdapter:
                     if status_callback:
                         status_callback("Boss 投递协程已结束，自动聊天协程继续监听 5 分钟新消息")
                     await chat_task
-                elif status_callback and auto_send_chat:
+                elif status_callback and chat_enabled:
                     status_callback("Boss 自动聊天协程已停止")
             finally:
                 delivery_finished.set()
@@ -2222,18 +2261,79 @@ class BossAdapter:
         if not os.path.exists(image_resume_path):
             logger.warning("Boss image resume path not found: %s", image_resume_path)
             return False
-        for selector in (
+
+        image_btn_selectors = (
+            '.toolbar-btn-content.icon.btn-sendimg',
+            '.toolbar-btn:has-text("图片")',
+            '.toolbar-btn:has-text("发图片")',
+            '[class*="sendimg"]',
+            '[class*="image-icon"]',
+            '[class*="upload-icon"]',
+            '.icon-image',
+            '.btn-image',
+        )
+        clicked_btn = False
+        for btn_selector in image_btn_selectors:
+            btn = chat_page.locator(btn_selector).first
+            with contextlib.suppress(Exception):
+                if await btn.count() and await btn.is_visible():
+                    await btn.scroll_into_view_if_needed()
+                    await btn.click()
+                    await chat_page.wait_for_timeout(1000)
+                    clicked_btn = True
+                    logger.info("Boss image button clicked: selector=%s", btn_selector)
+                    break
+
+        if not clicked_btn:
+            logger.debug("Boss image button not found, trying file input directly")
+
+        file_input_selectors = (
             '.toolbar-btn-content.icon.btn-sendimg input[type="file"]',
+            'input[type="file"][accept*="image"]',
+            'input[type="file"][accept*="png"]',
+            'input[type="file"][accept*="jpg"]',
+            'input[type="file"].sendimg',
             'input[type="file"]',
-        ):
+        )
+        uploaded = False
+        for selector in file_input_selectors:
             file_input = chat_page.locator(selector).first
             with contextlib.suppress(Exception):
                 if await file_input.count():
                     await file_input.set_input_files(image_resume_path)
                     await chat_page.wait_for_timeout(2000)
                     logger.info("Boss image resume uploaded via selector=%s path=%s", selector, image_resume_path)
-                    return True
-        return False
+                    uploaded = True
+                    break
+
+        if not uploaded:
+            logger.warning(
+                "Boss image resume failed: no file input found on chat page. "
+                "tried %d selectors, clicked_btn=%s, url=%s",
+                len(file_input_selectors),
+                clicked_btn,
+                chat_page.url,
+            )
+            return False
+
+        send_confirm_selectors = (
+            '.btn-send',
+            '.send-btn',
+            'button:has-text("发送")',
+            'button:has-text("确定")',
+            '[class*="confirm"]',
+            '[class*="send-image"]',
+        )
+        for send_selector in send_confirm_selectors:
+            send_btn = chat_page.locator(send_selector).first
+            with contextlib.suppress(Exception):
+                if await send_btn.count() and await send_btn.is_visible():
+                    await send_btn.click()
+                    await chat_page.wait_for_timeout(1000)
+                    logger.info("Boss image send button clicked: selector=%s", send_selector)
+                    break
+
+        return True
 
     async def _wait_for_chat_input(self, chat_page) -> bool:
         input_box = chat_page.locator(self.selectors.input_box).first

@@ -64,6 +64,19 @@ def run_migrations() -> None:
             """
         )
 
+    if not _has_table("app_settings"):
+        statements.append(
+            """
+            CREATE TABLE app_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key VARCHAR(80) NOT NULL UNIQUE,
+                value TEXT DEFAULT '',
+                category VARCHAR(40) DEFAULT 'general',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
     additions = [
         ("task_runs", "account_id", "INTEGER"),
         ("task_runs", "current_step_started_at", "DATETIME"),
@@ -75,7 +88,10 @@ def run_migrations() -> None:
         ("rule_configs", "dedupe_match_by_company", "BOOLEAN DEFAULT 1"),
         ("rule_configs", "enable_company_blacklist", "BOOLEAN DEFAULT 0"),
         ("rule_configs", "company_blacklist", "TEXT DEFAULT ''"),
-        ("jobs", "education_text", "VARCHAR(80) DEFAULT ''"),
+        ("rule_configs", "enable_job_title_blacklist", "BOOLEAN DEFAULT 0"),
+        ("rule_configs", "job_title_blacklist", "TEXT DEFAULT ''"),
+       ("jobs", "education_text", "VARCHAR(80) DEFAULT ''"),
+        ("task_runs", "config_json", "JSON DEFAULT '{}'"),
     ]
 
     for table_name, column_name, column_type in additions:

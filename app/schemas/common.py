@@ -52,8 +52,13 @@ class StartTaskRequest(BaseModel):
     cities: list[str] = Field(default_factory=list)
     enable_company_blacklist: bool = False
     company_blacklist: list[str] = Field(default_factory=list)
+    enable_job_title_blacklist: bool = False
+    job_title_blacklist: list[str] = Field(default_factory=list)
     salary_min: int | None = None
     salary_max: int | None = None
+    salary_floor_flexible_enabled: bool = False
+    salary_floor_min: int | None = Field(default=None, description="薪资下限容忍值，低于此值若最高薪资达标仍可投递")
+    salary_floor_required_max: int | None = Field(default=None, description="放宽下限时的最高薪资最低要求")
     cooldown_days: int = 7
     cross_account_dedupe_enabled: bool = False
     dedupe_match_by_title: bool = True
@@ -66,15 +71,16 @@ class StartTaskRequest(BaseModel):
     auto_send_chat: bool = False
     use_chat_template: bool = False
     chat_template: str = "您好，我刚刚投递了贵司的 {job_title} 岗位，期待进一步沟通，谢谢。"
-    enable_common_phrases: bool = True
+    enable_common_phrases: bool = False
     common_phrase_indexes: list[int] = Field(default_factory=lambda: [1])
     enable_image_resume: bool = False
     image_resume_path: str = ""
     auto_agree_wechat_card: bool = False
     boss_first_greeting_only: bool = False
-    enable_follow_up_reply: bool = True
+    enable_follow_up_reply: bool = False
     boss_reply_rules: list[BossReplyRuleIn] = Field(default_factory=_default_boss_reply_rules)
     boss_active_statuses: list[str] = Field(default_factory=lambda: ["不限"])
+    remark: str = ""
 
 
 class StopTaskRequest(BaseModel):
@@ -411,3 +417,49 @@ class ResumeCenterOut(BaseModel):
     import_logs: list[ResumeImportLogOut] = Field(default_factory=list)
     sync_runs: list[ResumeSyncRunOut] = Field(default_factory=list)
     platform_support: dict[str, dict[str, bool]] = Field(default_factory=dict)
+
+
+
+class LLMConfigOut(BaseModel):
+    base_url: str = ""
+    api_key_masked: str = ""
+    model: str = ""
+    temperature: float = 0.7
+    enabled: bool = False
+
+
+class LLMConfigUpdate(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    temperature: float = 0.7
+    enabled: bool = False
+
+
+class TaskRunOut(BaseModel):
+    id: int
+    platform: str
+    keyword: str = ""
+    status: str = ""
+    config_json: dict[str, Any] = Field(default_factory=dict)
+    processed_count: int = 0
+    delivered_count: int = 0
+    failed_count: int = 0
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    account_name: str | None = None
+
+
+class AIAdviseRequest(BaseModel):
+    platform: Platform
+    report_type: Literal["daily", "weekly", "strategy"] = "strategy"
+    date_from: date = Field(default_factory=local_today)
+    date_to: date | None = None
+
+
+class AIAdviseOut(BaseModel):
+    advice_text: str = ""
+    salary_suggestion: str = ""
+    timing_suggestion: str = ""
+    resume_suggestion: str = ""
+    raw_response: str = ""
