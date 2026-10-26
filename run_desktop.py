@@ -1,4 +1,5 @@
 import ctypes
+from pathlib import Path
 import logging
 import threading
 import time
@@ -36,6 +37,16 @@ def _warn_if_browser_missing() -> None:
         "桌面管理界面仍可打开，但账号登录配置、自动投递和聊天功能依赖外部浏览器。\n"
         "请先安装 Chrome 或 Edge，再继续使用自动化功能。",
     )
+
+
+class DesktopApi:
+    def export_config(self, name: str, content: str) -> bool:
+        paths = webview.windows[0].create_file_dialog(webview.FileDialog.SAVE, save_filename=Path(name).name, file_types=("JSON (*.json)",))
+        if not paths:
+            return False
+        target = paths if isinstance(paths, str) else paths[0]
+        Path(target).write_text(content, encoding="utf-8")
+        return True
 
 
 class DesktopUvicornServer(uvicorn.Server):
@@ -100,9 +111,10 @@ def main() -> int:
             min_size=(settings.desktop_window_min_width, settings.desktop_window_min_height),
             confirm_close=True,
             text_select=True,
+            js_api=DesktopApi(),
         )
         window.events.closed += lambda *_args: server.stop()
-        webview.start(debug=False)
+        webview.start(debug=False, private_mode=False, storage_path=str(Path(settings.browser_profile_root).parent / "desktop_webview"))
     except Exception as exc:  # noqa: BLE001
         logger.exception("Desktop window start failed: %s", exc)
         _show_native_message(settings.desktop_window_title, f"桌面窗口启动失败：{exc}")

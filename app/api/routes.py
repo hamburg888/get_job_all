@@ -1,14 +1,16 @@
 import base64
+import json
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import Body, APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.database import get_db
-from app.models.entities import Platform
+from app.models.entities import AppSetting, Platform
+from sqlalchemy import select
 from app.schemas.common import (
     AccountCreate,
     AccountOut,
@@ -99,11 +101,11 @@ def set_default_account_route(payload: AccountSetDefaultRequest, db: Session = D
 
 
 @router.post("/accounts/{account_id}/browser-config/open", response_model=BrowserConfigSessionOut)
-def open_account_browser_config(account_id: int, db: Session = Depends(get_db)) -> dict:
+def open_account_browser_config(account_id: int, site: bool = False, db: Session = Depends(get_db)) -> dict:
     account = get_account(db, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
-    return account_browser_service.open_for_account(account)
+    return account_browser_service.open_for_account(account, site=site)
 
 
 @router.post("/accounts/{account_id}/browser-config/close", response_model=BrowserConfigSessionOut)
@@ -316,3 +318,23 @@ def task_runs_by_platform(platform: str, limit: int = 50, db: Session = Depends(
 @router.post("/ai/advise", response_model=AIAdviseOut)
 def ai_advise(payload: AIAdviseRequest, db: Session = Depends(get_db)) -> dict:
     return build_ai_advice(db, payload)
+
+
+@router.get("/task-configs")
+def read_task_configs(db: Session = Depends(get_db)) -> dict:
+    rows = db.scalars(select(AppSetting).where(AppSetting.category == "task-config"))
+    return {row.key.split(".", 1)[1]: json.loads(row.value) for row in rows}
+
+
+@router.put("/task-configs/{platform}")
+def save_task_config(platform: Platform, record: dict = Body(...), db: Session = Depends(get_db)) -> dict:
+    if not isinstance(record.get("payload"), dict):
+        raise HTTPException(status_code=400, detail="Invalid configuration payload")
+    key = f"task-config.{platform.value}"
+    row = db.scalar(select(AppSetting).where(AppSetting.key == key))
+    if row is None:
+        row = AppSetting(key=key, category="task-config")
+        db.add(row)
+    row.value = json.dumps(record, ensure_ascii=False)
+    db.commit()
+    return record

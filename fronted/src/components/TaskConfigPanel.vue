@@ -336,7 +336,11 @@ function handleImportChange(event: Event) {
               <Input
                 v-model:value="form.manual_entry_url"
                 :placeholder="entryUrlPlaceholder"
-              />
+              >
+                <template #addonAfter>
+                  <Button type="link" :disabled="!selectedAccount || openBrowserButtonLoading" :loading="openBrowserButtonLoading" @click="selectedAccount && emit('open-account-browser', selectedAccount)">使用账号打开浏览器</Button>
+                </template>
+              </Input>
             </FormItem>
 
             <FormItem label="最低薪资 (K)">

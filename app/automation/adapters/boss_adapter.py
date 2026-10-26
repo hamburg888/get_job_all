@@ -7,6 +7,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -21,6 +22,7 @@ from app.automation.browser_factory import (
     build_browser_launch_options,
 )
 from app.automation.async_runner import run_async_blocking
+from app.services.profile_path_resolver import resolve_profile_dir
 from app.core.config import settings
 from app.services.live_preview_service import live_preview_service
 
@@ -251,12 +253,12 @@ class BossAdapter:
             if use_persistent_context:
                 launch_options = build_browser_launch_options(headless)
                 context = await playwright.chromium.launch_persistent_context(
-                    user_data_dir=profile_dir,
+                    user_data_dir=resolve_profile_dir(profile_dir),
                     **launch_options,
                 )
             else:
                 chrome_path = self._resolve_chrome_executable()
-                profile_path = Path(profile_dir)
+                profile_path = Path(resolve_profile_dir(profile_dir))
                 if not profile_path.is_absolute():
                     profile_path = Path.cwd() / profile_path
                 profile_path.mkdir(parents=True, exist_ok=True)
@@ -1423,7 +1425,7 @@ class BossAdapter:
             entry_url or "about:blank",
         ]
         quoted_file = chrome_path.replace("'", "''")
-        quoted_args = ", ".join("'" + str(arg).replace("'", "''") + "'" for arg in args)
+        quoted_args = "'" + subprocess.list2cmdline(args).replace("'", "''") + "'"
         command = (
             f"$p = Start-Process -FilePath '{quoted_file}' "
             f"-ArgumentList @({quoted_args}) -PassThru; "
@@ -1431,6 +1433,7 @@ class BossAdapter:
         )
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", command],
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             capture_output=True,
             text=True,
             check=True,
@@ -1468,6 +1471,7 @@ class BossAdapter:
             subprocess.run(
                 ["taskkill", "/PID", str(chrome_pid), "/T", "/F"],
                 check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 capture_output=True,
                 text=True,
             )
@@ -2833,12 +2837,12 @@ class BossAdapter:
             chrome_pid: int | None = None
             if use_persistent_context:
                 context = await playwright.chromium.launch_persistent_context(
-                    user_data_dir=profile_dir,
+                    user_data_dir=resolve_profile_dir(profile_dir),
                     **build_browser_launch_options(launch_headless),
                 )
             else:
                 chrome_path = self._resolve_chrome_executable()
-                profile_path = Path(profile_dir)
+                profile_path = Path(resolve_profile_dir(profile_dir))
                 if not profile_path.is_absolute():
                     profile_path = Path.cwd() / profile_path
                 profile_path.mkdir(parents=True, exist_ok=True)
@@ -3854,12 +3858,12 @@ class BossAdapter:
             chrome_pid: int | None = None
             if use_persistent_context:
                 context = await playwright.chromium.launch_persistent_context(
-                    user_data_dir=profile_dir,
+                    user_data_dir=resolve_profile_dir(profile_dir),
                     **build_browser_launch_options(launch_headless),
                 )
             else:
                 chrome_path = self._resolve_chrome_executable()
-                profile_path = Path(profile_dir)
+                profile_path = Path(resolve_profile_dir(profile_dir))
                 if not profile_path.is_absolute():
                     profile_path = Path.cwd() / profile_path
                 profile_path.mkdir(parents=True, exist_ok=True)

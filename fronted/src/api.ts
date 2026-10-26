@@ -134,8 +134,8 @@ export function setDefaultAccount(accountId: number) {
   })
 }
 
-export function openAccountBrowserConfig(accountId: number) {
-  return request<{ account_id: number; active: boolean; message: string }>(`/accounts/${accountId}/browser-config/open`, {
+export function openAccountBrowserConfig(accountId: number, site = false) {
+  return request<{ account_id: number; active: boolean; message: string }>(`/accounts/${accountId}/browser-config/open?site=${site}`, {
     method: 'POST',
   })
 }
@@ -284,4 +284,12 @@ export function fetchAIAdvice(payload: AIAdviceRequest) {
     method: 'POST',
     body: JSON.stringify(payload),
   }, 120_000)
+}
+
+export function fetchTaskConfigs() {
+  return request<Partial<Record<Platform, { saved_at: string | null; payload: Partial<StartTaskPayload> }>>>('/task-configs')
+}
+
+export function saveTaskConfig(platform: Platform, record: { saved_at: string; payload: StartTaskPayload }) {
+  return request(`/task-configs/${platform}`, { method: 'PUT', body: JSON.stringify(record) })
 }

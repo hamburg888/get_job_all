@@ -1,3 +1,4 @@
+import { fetchTaskConfigs, saveTaskConfig } from '../api'
 import { computed, reactive, ref, watch } from 'vue'
 
 import {
@@ -570,6 +571,10 @@ function serializeFormPayload(platform: Platform) {
 }
 
 function readStoredForms(): Partial<Record<Platform, SavedFormRecord>> {
+  try { return readLocalForms() } catch { return {} }
+}
+
+function readLocalForms(): Partial<Record<Platform, SavedFormRecord>> {
   const raw = window.localStorage.getItem(formStorageKey)
   if (raw) {
     try {
@@ -628,7 +633,7 @@ function applyStoredForms() {
   }
 }
 
-function persistSavedForms(platform: Platform) {
+async function persistSavedForms(platform: Platform) {
   const current = readStoredForms()
   const now = new Date().toISOString()
   const snapshot = snapshotFormPayload(platform)
@@ -636,7 +641,8 @@ function persistSavedForms(platform: Platform) {
     saved_at: now,
     payload: snapshot,
   }
-  window.localStorage.setItem(formStorageKey, JSON.stringify(current))
+  await saveTaskConfig(platform, { saved_at: now, payload: snapshot })
+  try { window.localStorage.setItem(formStorageKey, JSON.stringify(current)) } catch { /* Database is authoritative. */ }
   savedFormSnapshots[platform] = JSON.stringify(snapshot)
   formStateMeta[platform].dirty = false
   formStateMeta[platform].lastSavedAt = now
@@ -721,7 +727,7 @@ async function handleImageSelected(platform: Platform, file: File | null) {
   if (!file) {
     forms[platform].image_resume_path = ''
     imagePreviewUrls[platform] = ''
-    persistSavedForms(platform)
+    await persistSavedForms(platform)
     return
   }
   if (!file.type.startsWith('image/')) {
@@ -734,7 +740,7 @@ async function handleImageSelected(platform: Platform, file: File | null) {
     const result = await uploadBossImageResume(file)
     forms[platform].image_resume_path = result.path
     imagePreviewUrls[platform] = result.url ? `${API_ORIGIN}${result.url}` : deriveUploadedImageUrl(result.path)
-    persistSavedForms(platform)
+    await persistSavedForms(platform)
     pushToast(`图片已上传并保存：${result.name}`, 'success')
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '上传图片失败'
@@ -744,24 +750,37 @@ async function handleImageSelected(platform: Platform, file: File | null) {
   }
 }
 
-function saveFormConfig(platform: Platform) {
-  persistSavedForms(platform)
-  pushToast(`${meta[platform].name}配置已保存到本地`, 'success')
+async function saveFormConfig(platform: Platform) {
+  try {
+    await persistSavedForms(platform)
+    pushToast(`${meta[platform].name}配置已保存`, 'success')
+  } catch (error) {
+    pushToast(error instanceof Error ? error.message : '保存配置失败', 'danger')
+  }
 }
 
-function exportFormConfig(platform: Platform) {
+async function exportFormConfig(platform: Platform) {
   const payload = {
     platform,
     exported_at: new Date().toISOString(),
     payload: snapshotFormPayload(platform),
+  }
+  const desktop = (window as unknown as { pywebview?: { api?: { export_config: (name: string, content: string) => Promise<boolean> } } }).pywebview?.api
+  if (desktop) {
+    try {
+      if (await desktop.export_config(`job-help-${platform}-config.json`, JSON.stringify(payload, null, 2))) pushToast('配置已导出', 'success')
+    } catch (error) { pushToast(error instanceof Error ? error.message : '导出失败', 'danger') }
+    return
   }
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
   const url = window.URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
   anchor.download = `job-help-${platform}-config-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`
+  document.body.appendChild(anchor)
   anchor.click()
-  window.URL.revokeObjectURL(url)
+  anchor.remove()
+  window.setTimeout(() => window.URL.revokeObjectURL(url), 1000)
 }
 
 async function importFormConfig(platform: Platform, file: File | null) {
@@ -960,7 +979,7 @@ async function openAccountBrowserForSite(account: AccountItem) {
   browserConfigLoading.value = true
   browserConfigAccountId.value = account.id
   try {
-    await openAccountBrowserConfig(account.id)
+    await openAccountBrowserConfig(account.id, true)
     pushToast(
       `已使用 ${meta[account.platform].name} 账号 ${accountDisplayName(account)} 的 Cookie 打开对应网站`,
       'success',
@@ -1231,7 +1250,26 @@ async function initialize() {
   if (initialized) return
   initialized = true
   resetAccountForm()
-  applyStoredForms()
+  try {
+    const records = await fetchTaskConfigs()
+    // Seed legacy local settings once; subsequent reads use the database.
+    const legacy = readStoredForms()
+    for (const platform of platforms) {
+      const record = records[platform] ?? legacy[platform]
+      if (!record) continue
+      if (!records[platform]) {
+        await saveTaskConfig(platform, { saved_at: record.saved_at ?? new Date().toISOString(), payload: normalizeFormPayload(platform, record.payload) })
+      }
+      Object.assign(forms[platform], normalizeFormPayload(platform, record.payload))
+      savedFormSnapshots[platform] = serializeFormPayload(platform)
+      formStateMeta[platform].lastSavedAt = record.saved_at
+      formStateMeta[platform].dirty = false
+      imagePreviewUrls[platform] = deriveUploadedImageUrl(forms[platform].image_resume_path)
+    }
+  } catch (error) {
+    applyStoredForms()
+    pushToast(error instanceof Error ? error.message : '读取配置失败', 'danger')
+  }
   await checkBackendHealth()
   await refreshAll()
   pollTimer = window.setInterval(refreshAll, 3000)

@@ -54,7 +54,7 @@ class AccountBrowserService:
                 for state in self._sessions.values()
             )
 
-    def open_for_account(self, account: Account) -> dict:
+    def open_for_account(self, account: Account, *, site: bool = False) -> dict:
         with self._lock:
             current = self._sessions.get(account.id)
             if current and current.thread.is_alive():
@@ -69,7 +69,7 @@ class AccountBrowserService:
             state = BrowserConfigState(
                 thread=threading.Thread(
                     target=self._run_browser_session,
-                    args=(account.id, account.platform, account.profile_dir, stop_event, started_event),
+                    args=(account.id, account.platform, account.profile_dir, stop_event, started_event, site),
                     daemon=True,
                 ),
                 stop_event=stop_event,
@@ -117,12 +117,21 @@ class AccountBrowserService:
         profile_dir: str,
         stop_event: threading.Event,
         started_event: threading.Event,
+        site: bool = False,
     ) -> None:
         state = self._sessions.get(account_id)
         chrome_pid: int | None = None
         try:
             platform = Platform(platform_value)
             entry_url = self._platform_entry_url(platform)
+            if site:
+                entry_url = {
+                    Platform.BOSS: settings.boss_jobs_url,
+                    Platform.LIEPIN: settings.liepin_entry_url,
+                    Platform.YUPAO: settings.yupao_entry_url,
+                    Platform.ZHILIAN: settings.zhilian_entry_url,
+                    Platform.QIANCHENG: settings.qiancheng_entry_url,
+                }[platform]
             profile_path = Path(self._normalize_profile_dir(profile_dir))
             profile_path.mkdir(parents=True, exist_ok=True)
 
@@ -425,7 +434,7 @@ class AccountBrowserService:
         if debug_port:
             args.insert(0, f"--remote-debugging-port={debug_port}")
         quoted_file = chrome_path.replace("'", "''")
-        quoted_args = ", ".join("'" + str(arg).replace("'", "''") + "'" for arg in args)
+        quoted_args = "'" + subprocess.list2cmdline(args).replace("'", "''") + "'"
         command = (
             f"$p = Start-Process -FilePath '{quoted_file}' "
             f"-ArgumentList @({quoted_args}) -PassThru; "
@@ -433,6 +442,7 @@ class AccountBrowserService:
         )
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", command],
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             capture_output=True,
             text=True,
             check=True,
@@ -458,10 +468,31 @@ class AccountBrowserService:
     def _terminate_chrome_process(self, chrome_pid: int | None) -> None:
         if not chrome_pid:
             return
+        # Ask Chrome to close normally so cookies and session data reach disk.
+        if sys.platform == "win32" and self._is_process_alive(chrome_pid):
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def close_window(hwnd, _):
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value == chrome_pid:
+                    user32.PostMessageW(hwnd, 0x0010, 0, 0)
+                return True
+            user32.EnumWindows(callback_type(close_window), 0)
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline:
+                if not self._is_process_alive(chrome_pid):
+                    return
+                time.sleep(0.2)
         with contextlib.suppress(Exception):
             subprocess.run(
                 ["taskkill", "/PID", str(chrome_pid), "/T", "/F"],
                 check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 capture_output=True,
                 text=True,
             )
@@ -473,6 +504,7 @@ class AccountBrowserService:
         result = subprocess.run(
             ["tasklist", "/FI", f"PID eq {chrome_pid}"],
             check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             capture_output=True,
             text=True,
         )
